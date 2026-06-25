@@ -6,7 +6,7 @@
  */
 
 import {
-  DEFAULT_THRESHOLD,
+  DEFAULT_BUDGET,
   buildDetailReport,
   buildStatusParts,
   brailleChar,
@@ -29,19 +29,18 @@ const STYLE_ANSI: Record<StatusStyle, string> = {
   success: "\x1b[32m",
 };
 
-function renderStatus(records: RequestRecord[], liveCost = 0): string {
-  const parts = buildStatusParts(records, liveCost);
+function renderStatus(records: RequestRecord[]): string {
+  const parts = buildStatusParts(records);
   return parts.map(p => STYLE_ANSI[p.style] + p.text + RESET).join("  ");
 }
 
 function graph(
   records: RequestRecord[],
   liveCost = 0,
-  liveCtx = 0,
+  budget = DEFAULT_BUDGET,
   width = 40,
-  threshold = DEFAULT_THRESHOLD,
 ): string {
-  return renderBurnGraph(records, liveCost, liveCtx, threshold, width)[0] ?? "(empty)";
+  return renderBurnGraph(records, liveCost, budget, width)[0] ?? "(empty)";
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -106,15 +105,17 @@ const SESSION_SPIKE: RequestRecord[] = [
 
 section("Graph — visual (braille + color)");
 
-show("Growing session (bars taller + redder →)",  graph(SESSION_GROWING));
-show("Flat cost, growing ctx (color only →)",      graph(SESSION_FLAT_COST));
-show("Cost spike (tall bar in middle)",            graph(SESSION_SPIKE));
-show("1 record",                                  graph([{ endTime: 1, cost: 0.01, contextTokens: 50_000 }]));
+// Use a $0.10 budget so the test fixtures (totalling ~$0.085) fill the graph.
+const TEST_BUDGET = 0.10;
+show("Growing session (bars taller + redder →)",  graph(SESSION_GROWING,              0, TEST_BUDGET));
+show("Flat cost, growing ctx (color only →)",      graph(SESSION_FLAT_COST,            0, TEST_BUDGET));
+show("Cost spike (tall bar in middle)",            graph(SESSION_SPIKE,                0, TEST_BUDGET));
+show("1 record",                                  graph([{ endTime: 1, cost: 0.01, contextTokens: 0 }], 0, TEST_BUDGET));
 show("No records",                                graph([]));
-show("Live bar, no history",                      graph([], 0.007, 50_000));
-show("Live bar mid-session",                      graph(SESSION_GROWING.slice(0, 5), 0.008, 80_000));
-show("Custom threshold 75k (redder sooner)",       graph(SESSION_FLAT_COST, 0, 0, 40, 75_000));
-show("Over threshold (clamped to red)",            graph([{ endTime: 1, cost: 0.01, contextTokens: 300_000 }]));
+show("Live bar, no history",                      graph([], 0.007, TEST_BUDGET));
+show("Live bar mid-session",                      graph(SESSION_GROWING.slice(0, 5), 0.008, TEST_BUDGET));
+show("Custom budget $0.05 (redder sooner)",        graph(SESSION_FLAT_COST, 0, 0.05));
+show("Over budget (clamped to red)",               graph(SESSION_GROWING, 0, 0.05));
 
 // ── Graph correctness checks ──────────────────────────────────────────────────
 
@@ -123,13 +124,13 @@ section("Graph — correctness checks");
 // Empty input
 check(
   "empty records, no live cost → empty",
-  renderBurnGraph([], 0, 0, DEFAULT_THRESHOLD, 40)[0] ?? "(empty)",
+  renderBurnGraph([], 0, DEFAULT_BUDGET, 40)[0] ?? "(empty)",
   "(empty)",
 );
 
 // Single record: only right column should be lit (left is padding)
 const singleChar = renderBurnGraph(
-  [{ endTime: 1, cost: 0.01, contextTokens: 0 }], 0, 0, DEFAULT_THRESHOLD, 40,
+  [{ endTime: 1, cost: 0.01, contextTokens: 0 }], 0, DEFAULT_BUDGET, 40,
 )[0] ?? "";
 // Strip ANSI to get just the braille char
 const stripped = singleChar.replace(/\x1b\[[^m]*m/g, "");
@@ -148,20 +149,20 @@ check(
   "0",
 );
 
-// Over-threshold context should clamp to red (220, 0, 0)
+// Spend over budget clamps to red
 check(
-  "contextTokens > threshold → red color",
-  burnColor(Math.min(300_000 / DEFAULT_THRESHOLD, 1)),
+  "cumulative spend > budget → red color",
+  burnColor(Math.min(30 / 20, 1)),
   burnColor(1),
 );
 
-// Zero cost → no graph
+// A zero-cost record still renders (bar at minimum height)
 check(
-  "all-zero cost → empty output",
+  "zero cost record → renders (not skipped)",
   renderBurnGraph(
-    [{ endTime: 1, cost: 0, contextTokens: 10_000 }], 0, 0, DEFAULT_THRESHOLD, 40,
-  ).length === 0 ? "empty" : "not-empty",
-  "empty",
+    [{ endTime: 1, cost: 0, contextTokens: 0 }], 0, DEFAULT_BUDGET, 40,
+  ).length > 0 ? "rendered" : "empty",
+  "rendered",
 );
 
 // ── Braille char checks ───────────────────────────────────────────────────────
@@ -180,13 +181,13 @@ check("(3,3) → bottom 3 rows ⣶",   brailleChar(3, 3), "⣶");
 
 section("formatCost");
 
-check("$0",          formatCost(0),         "$0.000");
-check("$0.01",       formatCost(0.01),       "$0.010");
-check("$0.1",        formatCost(0.1),        "$0.100");
-check("$1.23456",    formatCost(1.23456),    "$1.235");
-check("0.005 -> ¢",  formatCost(0.005),      "0.500¢");
-check("0.000005",    formatCost(0.000005),   "0.5μ¢");
-check("tiny",        formatCost(0.000001),   "0.1μ¢");
+check("$0",          formatCost(0),         "$0.0000");
+check("$0.01",       formatCost(0.01),       "$0.0100");
+check("$0.1",        formatCost(0.1),        "$0.1000");
+check("$1.23456",    formatCost(1.23456),    "$1.2346");
+check("$0.005",      formatCost(0.005),      "$0.0050");
+check("$0.000005",   formatCost(0.000005),   "$0.0000");
+check("tiny",        formatCost(0.000001),   "$0.0000");
 
 // ── Status bar visual tests ───────────────────────────────────────────────────
 
@@ -204,14 +205,12 @@ show("Live cost in-flight",  renderStatus(SESSION_GROWING.slice(0, 5), 0.008));
 
 section("Status bar — correctness checks");
 
-const emptyParts = buildStatusParts([], 0);
-check("empty → 1 part",               String(emptyParts.length), "1");
-check("empty → dim style",            emptyParts[0].style, "dim");
-check("empty → $0.000",               emptyParts[0].text, "$0.000");
+const emptyParts = buildStatusParts([]);
+check("empty → 0 parts",              String(emptyParts.length), "0");
 
-const oneParts = buildStatusParts([{ endTime: 1, cost: 0.005, contextTokens: 0 }], 0);
-check("1 record → 2 parts",           String(oneParts.length), "2");
-check("1 record → muted /req part",   oneParts[1]?.style ?? "", "muted");
+const oneParts = buildStatusParts([{ endTime: 1, cost: 0.005, contextTokens: 0 }]);
+check("1 record → 1 part",            String(oneParts.length), "1");
+check("1 record → muted /req part",   oneParts[0]?.style ?? "", "muted");
 
 // Cost accumulation: 4 records, early cheaper than recent → warning multiplier
 const accelRecords: RequestRecord[] = [
@@ -220,17 +219,17 @@ const accelRecords: RequestRecord[] = [
   { endTime: 3, cost: 0.005, contextTokens: 0 },
   { endTime: 4, cost: 0.005, contextTokens: 0 },
 ];
-const accelParts = buildStatusParts(accelRecords, 0);
-check("accel → 3 parts",              String(accelParts.length), "3");
-check("accel → last part is warning", accelParts[2]?.style ?? "", "warning");
-check("accel → multiplier shown",     accelParts[2]?.text.startsWith("+") ?? false ? "yes" : "no", "yes");
+const accelParts = buildStatusParts(accelRecords);
+check("accel → 2 parts",              String(accelParts.length), "2");
+check("accel → last part is warning", accelParts[1]?.style ?? "", "warning");
+check("accel → multiplier shown",     accelParts[1]?.text.startsWith("+") ?? false ? "yes" : "no", "yes");
 
 // Stable: all equal cost → no multiplier annotation
 const stableRecords: RequestRecord[] = Array.from({ length: 4 }, (_, i) => ({
   endTime: i, cost: 0.005, contextTokens: 0,
 }));
-const stableParts = buildStatusParts(stableRecords, 0);
-check("stable cost → 2 parts (no multiplier)", String(stableParts.length), "2");
+const stableParts = buildStatusParts(stableRecords);
+check("stable cost → 1 part (no multiplier)", String(stableParts.length), "1");
 
 // Declining cost → success style
 const decliningRecords: RequestRecord[] = [
@@ -239,18 +238,18 @@ const decliningRecords: RequestRecord[] = [
   { endTime: 3, cost: 0.001, contextTokens: 0 },
   { endTime: 4, cost: 0.001, contextTokens: 0 },
 ];
-const decliningParts = buildStatusParts(decliningRecords, 0);
-check("declining → last part is success",      decliningParts[2]?.style ?? "", "success");
+const decliningParts = buildStatusParts(decliningRecords);
+check("declining → last part is success",      decliningParts[1]?.style ?? "", "success");
 
 // ── Detail report ─────────────────────────────────────────────────────────────
 
 section("Detail report");
 
 const now = Date.now();
-show("4-record report:\n" + buildDetailReport(SESSION_GROWING, now - 5 * 60_000, DEFAULT_THRESHOLD), "");
+process.stdout.write(buildDetailReport(SESSION_GROWING, now - 5 * 60_000, DEFAULT_BUDGET) + "\n\n");
 
 check("no records → message",
-  buildDetailReport([], now, DEFAULT_THRESHOLD),
+  buildDetailReport([], now, DEFAULT_BUDGET),
   "No completed requests yet.",
 );
 

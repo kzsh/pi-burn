@@ -31,7 +31,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
-  DEFAULT_THRESHOLD,
+  DEFAULT_BUDGET,
   buildDetailReport,
   buildStatusParts,
   formatCost,
@@ -52,12 +52,12 @@ export default function (pi: ExtensionAPI) {
   let records: RequestRecord[] = [];
   let currentRequestCost = 0;
   let currentContextTokens = 0;
-  let threshold = DEFAULT_THRESHOLD;
+  let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
 
-  pi.registerFlag("burn-threshold", {
-    description: `Context token count treated as the 'bad' end of the color scale (default: ${DEFAULT_THRESHOLD})`,
+  pi.registerFlag("burn-budget", {
+    description: `Session spend limit in dollars at which the graph turns fully red (default: $${DEFAULT_BUDGET})`,
     type: "string",
   });
 
@@ -69,10 +69,10 @@ export default function (pi: ExtensionAPI) {
     sessionStartTime = Date.now();
 
     // CLI flags are not available during the factory; read them here instead.
-    const flagVal = pi.getFlag("burn-threshold");
+    const flagVal = pi.getFlag("burn-budget");
     if (typeof flagVal === "string" && flagVal) {
-      const parsed = parseInt(flagVal, 10);
-      if (!isNaN(parsed) && parsed > 0) threshold = parsed;
+      const parsed = parseFloat(flagVal);
+      if (!isNaN(parsed) && parsed > 0) budget = parsed;
     }
 
     // Reconstruct history from session branch so that reloads and resumes
@@ -87,7 +87,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("burn-graph", (tui, _theme) => {
       widgetTui = tui;
       return {
-        render:    (width: number) => renderBurnGraph(records, currentRequestCost, currentContextTokens, threshold, width),
+        render:    (width: number) => renderBurnGraph(records, currentRequestCost, budget, width),
         invalidate: () => {},
       };
     });
@@ -130,7 +130,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("burn", {
     description: "Show cost burn rate details for this session",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(buildDetailReport(records, sessionStartTime, threshold), "info");
+      ctx.ui.notify(buildDetailReport(records, sessionStartTime, budget), "info");
     },
   });
 
@@ -172,7 +172,7 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatus(ctx: ExtensionContext) {
     const theme = ctx.ui.theme;
-    const parts = buildStatusParts(records, currentRequestCost);
+    const parts = buildStatusParts(records);
     ctx.ui.setStatus(
       "burn",
       parts.map(p => theme.fg(THEME_COLOR[p.style], p.text)).join("  "),
@@ -181,5 +181,5 @@ export default function (pi: ExtensionAPI) {
 
   // formatCost is exported from lib.ts and used in buildDetailReport, but the
   // extension also needs it for nothing currently — keep the import tidy.
-  void formatCost;
+
 }

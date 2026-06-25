@@ -2,7 +2,9 @@
  * pi-burn core logic — no pi dependencies, fully testable standalone.
  */
 
-export const DEFAULT_THRESHOLD = 150_000;
+// Session spend limit in dollars. At 40% of this value the graph turns yellow
+// ($4 on the default $10 budget); at 100% it turns fully red.
+export const DEFAULT_BUDGET = 10;
 
 export type RequestRecord = {
   endTime: number;      // ms epoch
@@ -35,10 +37,10 @@ export function brailleChar(leftHeight: number, rightHeight: number): string {
   return String.fromCodePoint(0x2800 + bits);
 }
 
-// t=0 => green (0,200,0), t=0.5 => yellow (220,200,0), t=1 => red (220,0,0)
+// t=0 => green, t=0.4 => yellow, t=1 => red
 export function burnColor(t: number): string {
-  const r = Math.round(Math.min(1, t * 2) * 220);
-  const g = Math.round(Math.min(1, (1 - t) * 2) * 200);
+  const r = Math.round(Math.min(1, t / 0.4) * 220);
+  const g = Math.round(Math.min(1, (1 - t) / 0.6) * 200);
   return `\x1b[38;2;${r};${g};0m`;
 }
 
@@ -49,24 +51,28 @@ const ANSI_RESET = "\x1b[0m";
 export function renderBurnGraph(
   records: RequestRecord[],
   currentRequestCost: number,
-  currentContextTokens: number,
-  threshold: number,
+  budget: number,
   width: number,
 ): string[] {
   // Append in-progress request as a live bar at the right edge.
   const allData: RequestRecord[] = currentRequestCost > 0
-    ? [...records, { endTime: Date.now(), cost: currentRequestCost, contextTokens: currentContextTokens }]
+    ? [...records, { endTime: Date.now(), cost: currentRequestCost, contextTokens: 0 }]
     : records;
 
   if (allData.length === 0) return [];
 
-  // Height: cost relative to session max (shows which requests were pricey).
-  const maxCost = Math.max(...allData.map(r => r.cost));
-  if (maxCost === 0) return [];
+  // Compute cumulative spend at each data point. Both height and color encode
+  // this value: bars grow taller and redder as the session budget is consumed.
+  // At budget/2 the graph turns yellow; at budget it turns fully red.
+  let running = 0;
+  const cumulative = allData.map(r => {
+    running += r.cost;
+    return running;
+  });
 
-  // Each braille char encodes 2 data columns; take the most recent slice that
-  // fits the available terminal width.
-  const data = allData.slice(-(width * 2));
+  // Take the most recent slice that fits the terminal width.
+  const data       = allData.slice(-(width * 2));
+  const cumSlice   = cumulative.slice(-(width * 2));
 
   // If the slice has an odd length, start at index -1 so the very first char
   // uses only its right column, keeping the newest point flush to the right.
@@ -74,21 +80,18 @@ export function renderBurnGraph(
 
   let line = "";
   for (let i = startIdx; i < data.length; i += 2) {
-    const left  = i >= 0              ? data[i]     : null;
-    const right = i + 1 < data.length ? data[i + 1] : null;
+    const li = i >= 0              ? i     : null;
+    const ri = i + 1 < data.length ? i + 1 : null;
 
-    // Height from relative cost.
-    const leftCostNorm  = left  ? left.cost  / maxCost : 0;
-    const rightCostNorm = right ? right.cost / maxCost : 0;
-    const leftHeight  = Math.round(leftCostNorm  * 4);
-    const rightHeight = Math.round(rightCostNorm * 4);
+    const leftNorm  = li !== null ? Math.min(cumSlice[li]!  / budget, 1) : 0;
+    const rightNorm = ri !== null ? Math.min(cumSlice[ri]!  / budget, 1) : 0;
 
-    // Color from absolute context size — never rescales as the session grows.
-    const leftColorT  = left  ? Math.min(left.contextTokens  / threshold, 1) : 0;
-    const rightColorT = right ? Math.min(right.contextTokens / threshold, 1) : 0;
-    const colorT = left && right
-      ? (leftColorT + rightColorT) / 2
-      : left ? leftColorT : rightColorT;
+    const leftHeight  = Math.round(leftNorm  * 4);
+    const rightHeight = Math.round(rightNorm * 4);
+
+    const colorT = li !== null && ri !== null
+      ? (leftNorm + rightNorm) / 2
+      : li !== null ? leftNorm : rightNorm;
 
     line += burnColor(colorT) + brailleChar(leftHeight, rightHeight) + ANSI_RESET;
   }
@@ -110,18 +113,12 @@ export type StatusPart = {
  * test) decides how to apply the styles — the extension uses pi's theme.fg(),
  * tests can apply simple ANSI codes directly.
  */
-export function buildStatusParts(
-  records: RequestRecord[],
-  currentRequestCost: number,
-): StatusPart[] {
-  if (records.length === 0 && currentRequestCost === 0) {
-    return [{ text: "$0.000", style: "dim" }];
+export function buildStatusParts(records: RequestRecord[]): StatusPart[] {
+  if (records.length === 0) {
+    return [];
   }
 
-  const totalCost = records.reduce((s, r) => s + r.cost, 0) + currentRequestCost;
   const parts: StatusPart[] = [];
-
-  parts.push({ text: `$${totalCost.toFixed(4)}`, style: "dim" });
 
   if (records.length >= 1) {
     const window = records.slice(-3);
@@ -150,7 +147,7 @@ export function buildStatusParts(
 export function buildDetailReport(
   records: RequestRecord[],
   sessionStartTime: number,
-  threshold: number,
+  budget: number,
 ): string {
   if (records.length === 0) return "No completed requests yet.";
 
@@ -164,7 +161,7 @@ export function buildDetailReport(
     `Session time: ${sessionMinutes.toFixed(1)} min`,
     `Avg /req:     ${formatCost(avgPerReq)}`,
     `Avg /min:     ${formatCost(totalCost / sessionMinutes)}`,
-    `Threshold:    ${threshold.toLocaleString()} tokens`,
+    `Budget:       $${budget.toFixed(2)}  (yellow ~$${(budget * 0.4).toFixed(2)}, red $${budget.toFixed(2)})`,
   ];
 
   if (records.length >= 2) {
@@ -190,8 +187,5 @@ export function buildDetailReport(
 // ── Shared formatting ─────────────────────────────────────────────────────────
 
 export function formatCost(usd: number): string {
-  if (usd === 0) return "$0.000";
-  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
-  if (usd >= 0.0001) return `${(usd * 100).toFixed(3)}¢`;
-  return `${(usd * 100_000).toFixed(1)}μ¢`;
+  return `$${usd.toFixed(4)}`;
 }
