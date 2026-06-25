@@ -28,11 +28,12 @@ session duration, and average burn rate per minute.
 
 ## Installation
 
-Drop this directory (or a symlink to it) under `~/.pi/agent/extensions/`,
-or add the path to `extensions` in your pi `settings.json`.
+```bash
+pi install git:github.com/kzsh/pi-burn
+```
 
 To test without installing globally:
 
 ```bash
-pi -e ./index.ts
+pi -e git:github.com/kzsh/pi-burn
 ```
