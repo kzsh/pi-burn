@@ -12,9 +12,11 @@ if [[ -z "$NAME" || "$NAME" == "null" ]]; then
   exit 1
 fi
 
-DEST="$HOME/.pi/agent/extensions/$NAME"
+# Strip npm scope prefix (@foo/) so the destination is a single directory name.
+BARE_NAME="${NAME#*/}"
+DEST="$HOME/.pi/agent/extensions/$BARE_NAME"
 
-echo "deploying $NAME"
+echo "deploying $BARE_NAME"
 echo "  from: $PROJECT_ROOT"
 echo "    to: $DEST"
 
