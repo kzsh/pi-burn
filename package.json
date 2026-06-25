@@ -1,0 +1,8 @@
+{
+  "name": "pi-burn",
+  "version": "0.1.0",
+  "description": "Track cost-per-request acceleration in pi sessions",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
