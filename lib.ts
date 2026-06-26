@@ -7,9 +7,12 @@
 export const DEFAULT_BUDGET = 10;
 
 export type RequestRecord = {
-  endTime: number;      // ms epoch
-  cost: number;         // USD
-  contextTokens: number; // msg.usage.input of last assistant turn in the run
+  endTime: number;       // ms epoch
+  cost: number;          // USD
+  inputTokens: number;   // non-cached input tokens for the run
+  outputTokens: number;  // total output tokens for the run
+  cacheWriteTokens: number;
+  cacheHitTokens: number;
 };
 
 // ── Braille helpers ──────────────────────────────────────────────────────────
@@ -46,57 +49,107 @@ export function burnColor(t: number): string {
 
 const ANSI_RESET = "\x1b[0m";
 
-// ── Graph ─────────────────────────────────────────────────────────────────────
+// ── Token type colors ────────────────────────────────────────────────────────
+//
+// Stacking order in the bar, bottom to top:
+//   cacheHit (cheapest)  →  input  →  cacheWrite  →  output (priciest)
+//
+const COLOR_CACHE_HIT   = "\x1b[38;2;0;180;200m";   // cyan
+const COLOR_INPUT       = "\x1b[38;2;80;190;80m";    // green
+const COLOR_CACHE_WRITE = "\x1b[38;2;210;170;0m";    // amber
+const COLOR_OUTPUT      = "\x1b[38;2;220;80;0m";     // orange-red
 
+function tokenTotal(r: RequestRecord): number {
+  return r.inputTokens + r.outputTokens + r.cacheWriteTokens + r.cacheHitTokens;
+}
+
+// Given a vertical midpoint `dotMid` in 0-8 dot space and a scale factor
+// (scale = 8 / maxTotal across visible window), return the ANSI color for the
+// token zone occupying that position in record `r`'s stacked bar.
+function tokenZoneColor(dotMid: number, r: RequestRecord, scale: number): string {
+  const z0 = r.cacheHitTokens * scale;
+  const z1 = (r.cacheHitTokens + r.inputTokens) * scale;
+  const z2 = (r.cacheHitTokens + r.inputTokens + r.cacheWriteTokens) * scale;
+  if (dotMid < z0) return COLOR_CACHE_HIT;
+  if (dotMid < z1) return COLOR_INPUT;
+  if (dotMid < z2) return COLOR_CACHE_WRITE;
+  return COLOR_OUTPUT;
+}
+
+// ── Graph ─────────────────────────────────────────────────────────────────────
+//
+// Returns two lines: [topRow, bottomRow].  Each column encodes two adjacent
+// data points as a single braille character (left = older, right = newer).
+//
+// Bar HEIGHT represents total tokens for that request (input + output +
+// cache_write + cache_hit), scaled to the session max.  Two rows of braille
+// give 8 dot levels of resolution so small changes are visible.
+//
+// Bar COLOR shows the token breakdown as a stacked bar:
+//   bottom → top:  cacheHit (cyan)  input (green)  cacheWrite (amber)  output (orange)
+//
+// Pass a partial `liveRecord` built from the current in-flight request to show
+// a live bar at the right edge while the request is streaming.
+//
 export function renderBurnGraph(
   records: RequestRecord[],
-  currentRequestCost: number,
-  budget: number,
+  liveRecord: RequestRecord | null,
   width: number,
 ): string[] {
-  // Append in-progress request as a live bar at the right edge.
-  const allData: RequestRecord[] = currentRequestCost > 0
-    ? [...records, { endTime: Date.now(), cost: currentRequestCost, contextTokens: 0 }]
-    : records;
-
+  const allData = liveRecord ? [...records, liveRecord] : records;
   if (allData.length === 0) return [];
 
-  // Compute cumulative spend at each data point. Both height and color encode
-  // this value: bars grow taller and redder as the session budget is consumed.
-  // At budget/2 the graph turns yellow; at budget it turns fully red.
-  let running = 0;
-  const cumulative = allData.map(r => {
-    running += r.cost;
-    return running;
-  });
+  // Most-recent slice that fits the terminal width (2 data points per char).
+  const data = allData.slice(-(width * 2));
 
-  // Take the most recent slice that fits the terminal width.
-  const data       = allData.slice(-(width * 2));
-  const cumSlice   = cumulative.slice(-(width * 2));
+  const maxTotal = Math.max(1, ...data.map(tokenTotal));
+  const scale    = 8 / maxTotal; // maps token count → 0-8 dot space
 
   // If the slice has an odd length, start at index -1 so the very first char
-  // uses only its right column, keeping the newest point flush to the right.
+  // uses only its right column, keeping the newest point flush-right.
   const startIdx = -(data.length % 2);
 
-  let line = "";
+  let topLine    = "";
+  let bottomLine = "";
+
   for (let i = startIdx; i < data.length; i += 2) {
-    const li = i >= 0              ? i     : null;
-    const ri = i + 1 < data.length ? i + 1 : null;
+    const lRec = i >= 0              ? data[i]!     : null;
+    const rRec = i + 1 < data.length ? data[i + 1]! : null;
 
-    const leftNorm  = li !== null ? Math.min(cumSlice[li]!  / budget, 1) : 0;
-    const rightNorm = ri !== null ? Math.min(cumSlice[ri]!  / budget, 1) : 0;
+    const lDots = lRec ? Math.round(tokenTotal(lRec) * scale) : 0;
+    const rDots = rRec ? Math.round(tokenTotal(rRec) * scale) : 0;
 
-    const leftHeight  = Math.round(leftNorm  * 4);
-    const rightHeight = Math.round(rightNorm * 4);
+    // Bottom row: lower 4 dots of each sub-column bar
+    const lBot = Math.min(4, lDots);
+    const rBot = Math.min(4, rDots);
+    // Top row: upper 4 dots (only present when bar exceeds 4 dots)
+    const lTop = Math.max(0, lDots - 4);
+    const rTop = Math.max(0, rDots - 4);
 
-    const colorT = li !== null && ri !== null
-      ? (leftNorm + rightNorm) / 2
-      : li !== null ? leftNorm : rightNorm;
+    // Color representative for the char: prefer the right (newer) record.
+    const repRec = rRec ?? lRec!;
 
-    line += burnColor(colorT) + brailleChar(leftHeight, rightHeight) + ANSI_RESET;
+    // Bottom-row color: midpoint of the right sub-column's fill in that row.
+    const rBotMid = rBot / 2;
+    const botColor = (lBot > 0 || rBot > 0)
+      ? tokenZoneColor(rBotMid, repRec, scale)
+      : "";
+
+    // Top-row color: midpoint of the right sub-column's fill, offset by 4.
+    const rTopMid = 4 + rTop / 2;
+    const topColor = (lTop > 0 || rTop > 0)
+      ? tokenZoneColor(rTopMid, repRec, scale)
+      : "";
+
+    topLine += (lTop > 0 || rTop > 0)
+      ? topColor + brailleChar(lTop, rTop) + ANSI_RESET
+      : " ";
+    bottomLine += (lBot > 0 || rBot > 0)
+      ? botColor + brailleChar(lBot, rBot) + ANSI_RESET
+      : brailleChar(0, 0); // empty braille for alignment
   }
 
-  return line.length > 0 ? [line] : [];
+  return [topLine, bottomLine];
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -176,7 +229,9 @@ export function buildDetailReport(
     lines.push("");
     lines.push("Per-request cost history:");
     records.forEach((r, i) => {
-      const ctx = r.contextTokens > 0 ? `  ${(r.contextTokens / 1000).toFixed(0)}k ctx` : "";
+      const ctx = (r.inputTokens + r.cacheHitTokens) > 0
+        ? `  ${((r.inputTokens + r.cacheHitTokens) / 1000).toFixed(0)}k ctx`
+        : "";
       lines.push(`  [${String(i + 1).padStart(2)}]  ${formatCost(r.cost)}${ctx}`);
     });
   }

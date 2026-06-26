@@ -34,13 +34,14 @@ function renderStatus(records: RequestRecord[]): string {
   return parts.map(p => STYLE_ANSI[p.style] + p.text + RESET).join("  ");
 }
 
+// Helper to render the two-row graph as a block for show().
 function graph(
   records: RequestRecord[],
-  liveCost = 0,
-  budget = DEFAULT_BUDGET,
+  liveRecord: RequestRecord | null = null,
   width = 40,
 ): string {
-  return renderBurnGraph(records, liveCost, budget, width)[0] ?? "(empty)";
+  const lines = renderBurnGraph(records, liveRecord, width);
+  return lines.join("\n") || "(empty)";
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -52,9 +53,13 @@ function section(title: string) {
   process.stdout.write(`\n\x1b[1m${title}\x1b[0m\n${"─".repeat(title.length)}\n`);
 }
 
-function show(label: string, line: string) {
-  const pad = label.padEnd(38);
-  process.stdout.write(`  ${pad} ${line}\n`);
+function show(label: string, content: string) {
+  const lines = content.split("\n");
+  const pad   = label.padEnd(38);
+  process.stdout.write(`  ${pad} ${lines[0] ?? ""}\n`);
+  for (const l of lines.slice(1)) {
+    process.stdout.write(`  ${" ".repeat(38)} ${l}\n`);
+  }
 }
 
 function check(label: string, actual: string, expected: string) {
@@ -71,98 +76,135 @@ function check(label: string, actual: string, expected: string) {
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-// A realistic session: context grows towards the threshold, cost varies.
+// A realistic session: context and cache usage grow over time.
+// cacheHit grows as more prior context is served from cache.
 const SESSION_GROWING: RequestRecord[] = [
-  { endTime: 1, cost: 0.003, contextTokens:  10_000 },
-  { endTime: 2, cost: 0.004, contextTokens:  20_000 },
-  { endTime: 3, cost: 0.006, contextTokens:  35_000 },
-  { endTime: 4, cost: 0.005, contextTokens:  50_000 },
-  { endTime: 5, cost: 0.009, contextTokens:  70_000 },
-  { endTime: 6, cost: 0.007, contextTokens:  90_000 },
-  { endTime: 7, cost: 0.012, contextTokens: 110_000 },
-  { endTime: 8, cost: 0.010, contextTokens: 130_000 },
-  { endTime: 9, cost: 0.015, contextTokens: 148_000 },
-  { endTime:10, cost: 0.014, contextTokens: 155_000 },
+  { endTime:  1, cost: 0.003, inputTokens:  10_000, outputTokens:   800, cacheWriteTokens: 10_000, cacheHitTokens:       0 },
+  { endTime:  2, cost: 0.004, inputTokens:  20_000, outputTokens:   900, cacheWriteTokens:  5_000, cacheHitTokens:  10_000 },
+  { endTime:  3, cost: 0.006, inputTokens:  35_000, outputTokens: 1_200, cacheWriteTokens:  5_000, cacheHitTokens:  20_000 },
+  { endTime:  4, cost: 0.005, inputTokens:  50_000, outputTokens: 1_000, cacheWriteTokens:  5_000, cacheHitTokens:  35_000 },
+  { endTime:  5, cost: 0.009, inputTokens:  70_000, outputTokens: 1_800, cacheWriteTokens:  5_000, cacheHitTokens:  50_000 },
+  { endTime:  6, cost: 0.007, inputTokens:  90_000, outputTokens: 1_400, cacheWriteTokens:  5_000, cacheHitTokens:  70_000 },
+  { endTime:  7, cost: 0.012, inputTokens: 110_000, outputTokens: 2_400, cacheWriteTokens:  5_000, cacheHitTokens:  90_000 },
+  { endTime:  8, cost: 0.010, inputTokens: 130_000, outputTokens: 2_000, cacheWriteTokens:  5_000, cacheHitTokens: 110_000 },
+  { endTime:  9, cost: 0.015, inputTokens: 148_000, outputTokens: 3_000, cacheWriteTokens:  5_000, cacheHitTokens: 130_000 },
+  { endTime: 10, cost: 0.014, inputTokens: 155_000, outputTokens: 2_800, cacheWriteTokens:  5_000, cacheHitTokens: 148_000 },
 ];
 
-// Uniform cost but context grows — old relative graph: all red; new: gradient.
+// Uniform cost, growing context — bars grow steadily without spending variance.
 const SESSION_FLAT_COST: RequestRecord[] = Array.from({ length: 10 }, (_, i) => ({
-  endTime: i + 1,
-  cost: 0.005,
-  contextTokens: (i + 1) * 15_000,
+  endTime:          i + 1,
+  cost:             0.005,
+  inputTokens:      (i + 1) * 15_000,
+  outputTokens:     1_000,
+  cacheWriteTokens: 5_000,
+  cacheHitTokens:   i * 14_000,
 }));
 
 // One expensive spike in the middle.
 const SESSION_SPIKE: RequestRecord[] = [
-  { endTime: 1, cost: 0.003, contextTokens:  20_000 },
-  { endTime: 2, cost: 0.004, contextTokens:  40_000 },
-  { endTime: 3, cost: 0.030, contextTokens:  60_000 },  // spike
-  { endTime: 4, cost: 0.004, contextTokens:  80_000 },
-  { endTime: 5, cost: 0.005, contextTokens: 100_000 },
+  { endTime: 1, cost: 0.003, inputTokens:  20_000, outputTokens:   800, cacheWriteTokens: 10_000, cacheHitTokens:      0 },
+  { endTime: 2, cost: 0.004, inputTokens:  40_000, outputTokens: 1_000, cacheWriteTokens:  5_000, cacheHitTokens: 20_000 },
+  { endTime: 3, cost: 0.030, inputTokens:  60_000, outputTokens: 8_000, cacheWriteTokens:  5_000, cacheHitTokens: 40_000 }, // spike
+  { endTime: 4, cost: 0.004, inputTokens:  80_000, outputTokens: 1_000, cacheWriteTokens:  5_000, cacheHitTokens: 60_000 },
+  { endTime: 5, cost: 0.005, inputTokens: 100_000, outputTokens: 1_200, cacheWriteTokens:  5_000, cacheHitTokens: 80_000 },
 ];
 
 // ── Graph visual tests ────────────────────────────────────────────────────────
 
-section("Graph — visual (braille + color)");
+section("Graph — visual (braille + color, 2 rows)");
 
-// Use a $0.10 budget so the test fixtures (totalling ~$0.085) fill the graph.
-const TEST_BUDGET = 0.10;
-show("Growing session (bars taller + redder →)",  graph(SESSION_GROWING,              0, TEST_BUDGET));
-show("Flat cost, growing ctx (color only →)",      graph(SESSION_FLAT_COST,            0, TEST_BUDGET));
-show("Cost spike (tall bar in middle)",            graph(SESSION_SPIKE,                0, TEST_BUDGET));
-show("1 record",                                  graph([{ endTime: 1, cost: 0.01, contextTokens: 0 }], 0, TEST_BUDGET));
+const LIVE: RequestRecord = {
+  endTime: Date.now(), cost: 0.008,
+  inputTokens: 40_000, outputTokens: 1_500, cacheWriteTokens: 5_000, cacheHitTokens: 20_000,
+};
+
+show("Growing session (taller → more cache →)",   graph(SESSION_GROWING));
+show("Flat cost, growing ctx",                     graph(SESSION_FLAT_COST));
+show("Cost spike (tall bar in middle)",            graph(SESSION_SPIKE));
+show("1 record",                                  graph([SESSION_GROWING[0]!]));
 show("No records",                                graph([]));
-show("Live bar, no history",                      graph([], 0.007, TEST_BUDGET));
-show("Live bar mid-session",                      graph(SESSION_GROWING.slice(0, 5), 0.008, TEST_BUDGET));
-show("Custom budget $0.05 (redder sooner)",        graph(SESSION_FLAT_COST, 0, 0.05));
-show("Over budget (clamped to red)",               graph(SESSION_GROWING, 0, 0.05));
+show("Live bar, no history",                      graph([], LIVE));
+show("Live bar mid-session",                      graph(SESSION_GROWING.slice(0, 5), LIVE));
 
 // ── Graph correctness checks ──────────────────────────────────────────────────
 
 section("Graph — correctness checks");
 
-// Empty input
+// Empty input → empty
 check(
-  "empty records, no live cost → empty",
-  renderBurnGraph([], 0, DEFAULT_BUDGET, 40)[0] ?? "(empty)",
+  "empty records, no live → empty",
+  renderBurnGraph([], null, 40)[0] ?? "(empty)",
   "(empty)",
 );
 
-// Single record: only right column should be lit (left is padding)
-const singleChar = renderBurnGraph(
-  [{ endTime: 1, cost: 0.01, contextTokens: 0 }], 0, DEFAULT_BUDGET, 40,
-)[0] ?? "";
-// Strip ANSI to get just the braille char
-const stripped = singleChar.replace(/\x1b\[[^m]*m/g, "");
+// renderBurnGraph always returns 2 lines when there is data
+const twoRowLines = renderBurnGraph([SESSION_GROWING[0]!], null, 40);
 check(
-  "single record → right column only (⢸ or similar, left col empty)",
-  (stripped.codePointAt(0) ?? 0) >= 0x2800 && (stripped.codePointAt(0) ?? 0) <= 0x28ff
+  "single record → 2-element array",
+  String(twoRowLines.length),
+  "2",
+);
+
+// Single record: bottom row has only the right column lit (left is padding)
+const bottomRow = twoRowLines[1] ?? "";
+const strippedBottom = bottomRow.replace(/\x1b\[[^m]*m/g, "");
+check(
+  "single record → bottom row is a braille char",
+  (strippedBottom.codePointAt(0) ?? 0) >= 0x2800 && (strippedBottom.codePointAt(0) ?? 0) <= 0x28ff
     ? "braille"
     : "not-braille",
   "braille",
 );
-// Left column bits (1,2,4,64) should be zero — only right column dots set
-const charCode = (stripped.codePointAt(0) ?? 0x2800) - 0x2800;
+const charCode = (strippedBottom.codePointAt(0) ?? 0x2800) - 0x2800;
 check(
-  "single record → left column dots are all zero",
+  "single record → left column dots are all zero (right-column padding)",
   String(charCode & (1 | 2 | 4 | 64)),
   "0",
 );
 
-// Spend over budget clamps to red
+// burnColor clamping still works
 check(
-  "cumulative spend > budget → red color",
-  burnColor(Math.min(30 / 20, 1)),
+  "burnColor(>1) clamps to burnColor(1)",
+  burnColor(Math.min(1.5, 1)),
   burnColor(1),
 );
 
-// A zero-cost record still renders (bar at minimum height)
+// A record with all-zero tokens still renders (bar at 0 height, but 2 rows returned)
+const zeroTokenRec: RequestRecord = {
+  endTime: 1, cost: 0,
+  inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheHitTokens: 0,
+};
 check(
-  "zero cost record → renders (not skipped)",
-  renderBurnGraph(
-    [{ endTime: 1, cost: 0, contextTokens: 0 }], 0, DEFAULT_BUDGET, 40,
-  ).length > 0 ? "rendered" : "empty",
-  "rendered",
+  "zero token record → still returns 2 rows",
+  String(renderBurnGraph([zeroTokenRec], null, 40).length),
+  "2",
+);
+
+// A record with tokens renders a non-empty bar in the bottom row
+const tallRec: RequestRecord = {
+  endTime: 1, cost: 0.01,
+  inputTokens: 10_000, outputTokens: 500, cacheWriteTokens: 1_000, cacheHitTokens: 0,
+};
+const tallLines = renderBurnGraph([tallRec], null, 40);
+const tallBottom = (tallLines[1] ?? "").replace(/\x1b\[[^m]*m/g, "");
+check(
+  "token record → bottom row has a filled braille char",
+  ((tallBottom.codePointAt(0) ?? 0x2800) - 0x2800) > 0 ? "filled" : "empty",
+  "filled",
+);
+
+// Taller session fills the top row too
+const maxRec: RequestRecord = {
+  endTime: 1, cost: 0.05,
+  inputTokens: 200_000, outputTokens: 5_000, cacheWriteTokens: 10_000, cacheHitTokens: 50_000,
+};
+const maxLines = renderBurnGraph([maxRec], null, 40);
+const maxTop    = (maxLines[0] ?? "").replace(/\x1b\[[^m]*m/g, "").trim();
+check(
+  "max-height record → top row is non-empty",
+  maxTop.length > 0 ? "non-empty" : "empty",
+  "non-empty",
 );
 
 // ── Braille char checks ───────────────────────────────────────────────────────
@@ -194,12 +236,11 @@ check("tiny",        formatCost(0.000001),   "$0.0000");
 section("Status bar — visual");
 
 show("No records",           renderStatus([]));
-show("1 record",             renderStatus([{ endTime: 1, cost: 0.005, contextTokens: 10_000 }]));
+show("1 record",             renderStatus([SESSION_GROWING[0]!]));
 show("3 records",            renderStatus(SESSION_GROWING.slice(0, 3)));
 show("4 records (accel)",    renderStatus(SESSION_GROWING.slice(0, 4)));
 show("10 records growing",   renderStatus(SESSION_GROWING));
 show("10 records flat",      renderStatus(SESSION_FLAT_COST));
-show("Live cost in-flight",  renderStatus(SESSION_GROWING.slice(0, 5), 0.008));
 
 // ── Status bar correctness checks ─────────────────────────────────────────────
 
@@ -208,16 +249,16 @@ section("Status bar — correctness checks");
 const emptyParts = buildStatusParts([]);
 check("empty → 0 parts",              String(emptyParts.length), "0");
 
-const oneParts = buildStatusParts([{ endTime: 1, cost: 0.005, contextTokens: 0 }]);
+const oneParts = buildStatusParts([SESSION_GROWING[0]!]);
 check("1 record → 1 part",            String(oneParts.length), "1");
 check("1 record → muted /req part",   oneParts[0]?.style ?? "", "muted");
 
 // Cost accumulation: 4 records, early cheaper than recent → warning multiplier
 const accelRecords: RequestRecord[] = [
-  { endTime: 1, cost: 0.001, contextTokens: 0 },
-  { endTime: 2, cost: 0.001, contextTokens: 0 },
-  { endTime: 3, cost: 0.005, contextTokens: 0 },
-  { endTime: 4, cost: 0.005, contextTokens: 0 },
+  { endTime: 1, cost: 0.001, inputTokens: 1_000, outputTokens: 100, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 2, cost: 0.001, inputTokens: 2_000, outputTokens: 100, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 3, cost: 0.005, inputTokens: 3_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 4, cost: 0.005, inputTokens: 4_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0 },
 ];
 const accelParts = buildStatusParts(accelRecords);
 check("accel → 2 parts",              String(accelParts.length), "2");
@@ -226,17 +267,18 @@ check("accel → multiplier shown",     accelParts[1]?.text.startsWith("+") ?? f
 
 // Stable: all equal cost → no multiplier annotation
 const stableRecords: RequestRecord[] = Array.from({ length: 4 }, (_, i) => ({
-  endTime: i, cost: 0.005, contextTokens: 0,
+  endTime: i, cost: 0.005,
+  inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0,
 }));
 const stableParts = buildStatusParts(stableRecords);
 check("stable cost → 1 part (no multiplier)", String(stableParts.length), "1");
 
 // Declining cost → success style
 const decliningRecords: RequestRecord[] = [
-  { endTime: 1, cost: 0.010, contextTokens: 0 },
-  { endTime: 2, cost: 0.010, contextTokens: 0 },
-  { endTime: 3, cost: 0.001, contextTokens: 0 },
-  { endTime: 4, cost: 0.001, contextTokens: 0 },
+  { endTime: 1, cost: 0.010, inputTokens: 10_000, outputTokens: 1_000, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 2, cost: 0.010, inputTokens: 10_000, outputTokens: 1_000, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 3, cost: 0.001, inputTokens:  1_000, outputTokens:   100, cacheWriteTokens: 0, cacheHitTokens: 0 },
+  { endTime: 4, cost: 0.001, inputTokens:  1_000, outputTokens:   100, cacheWriteTokens: 0, cacheHitTokens: 0 },
 ];
 const decliningParts = buildStatusParts(decliningRecords);
 check("declining → last part is success",      decliningParts[1]?.style ?? "", "success");

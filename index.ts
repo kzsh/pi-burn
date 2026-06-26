@@ -14,18 +14,17 @@
  * split into early vs recent halves meaningfully).
  *
  * Widget (above editor):
- *   Braille sparkline, left = oldest request, right = newest.
+ *   Two-row braille sparkline, left = oldest request, right = newest.
  *
- *   Bar HEIGHT: per-request cost relative to the session max. Tall = expensive
- *               relative to other requests in this session.
+ *   Bar HEIGHT: total tokens (input + output + cache_write + cache_hit) for
+ *               that request, scaled to the session max across the visible
+ *               window.  Two rows of braille = 8 dot levels of resolution.
  *
- *   Bar COLOR:  input tokens / threshold. Green = small context, yellow =
- *               growing, red = at or over the threshold. The scale is absolute
- *               and never rescales as the session grows, so the graph drifts
- *               green → red over the course of a session as expected.
- *
- *   Default threshold: 150,000 tokens.
- *   Override with:     pi --burn-threshold 100000
+ *   Bar COLOR:  stacked by token type, bottom → top:
+ *               cyan  = cache_hit   (cheapest per token)
+ *               green = input
+ *               amber = cache_write
+ *               orange = output     (most expensive per token)
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -34,7 +33,6 @@ import {
   DEFAULT_BUDGET,
   buildDetailReport,
   buildStatusParts,
-  formatCost,
   renderBurnGraph,
   type RequestRecord,
   type StatusStyle,
@@ -50,8 +48,11 @@ const THEME_COLOR: Record<StatusStyle, string> = {
 
 export default function (pi: ExtensionAPI) {
   let records: RequestRecord[] = [];
-  let currentRequestCost = 0;
-  let currentContextTokens = 0;
+  let currentRequestCost    = 0;
+  let currentInputTokens    = 0;
+  let currentOutputTokens   = 0;
+  let currentCacheWriteTokens = 0;
+  let currentCacheHitTokens   = 0;
   let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
@@ -64,8 +65,11 @@ export default function (pi: ExtensionAPI) {
   // ── Session lifecycle ──────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    currentRequestCost = 0;
-    currentContextTokens = 0;
+    currentRequestCost      = 0;
+    currentInputTokens      = 0;
+    currentOutputTokens     = 0;
+    currentCacheWriteTokens = 0;
+    currentCacheHitTokens   = 0;
     sessionStartTime = Date.now();
 
     // CLI flags are not available during the factory; read them here instead.
@@ -87,7 +91,19 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWidget("burn-graph", (tui, _theme) => {
       widgetTui = tui;
       return {
-        render:    (width: number) => renderBurnGraph(records, currentRequestCost, budget, width),
+        render: (width: number) => {
+          const live: RequestRecord | null = (currentRequestCost > 0 || currentInputTokens > 0)
+            ? {
+                endTime:          Date.now(),
+                cost:             currentRequestCost,
+                        inputTokens:      currentInputTokens,
+                outputTokens:     currentOutputTokens,
+                cacheWriteTokens: currentCacheWriteTokens,
+                cacheHitTokens:   currentCacheHitTokens,
+              }
+            : null;
+          return renderBurnGraph(records, live, width);
+        },
         invalidate: () => {},
       };
     });
@@ -103,24 +119,34 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, _ctx) => {
     if (event.message.role !== "assistant") return;
     const msg = event.message as AssistantMessage;
-    currentRequestCost += msg.usage?.cost?.total ?? 0;
-    // Always overwrite; later turns have larger context, so this ends up as the
-    // maximum input-token count seen within the current run.
-    currentContextTokens = msg.usage?.input ?? 0;
+    currentRequestCost      += msg.usage?.cost?.total ?? 0;
+    // Input/cacheHit/cacheWrite are overwritten: later turns have the full
+    // accumulated context, so the last value is always the largest.
+    currentInputTokens       = msg.usage?.input       ?? 0;
+    currentCacheHitTokens    = msg.usage?.cacheRead   ?? 0;
+    currentCacheWriteTokens  = msg.usage?.cacheWrite  ?? 0;
+    // Output accumulates across turns within one run.
+    currentOutputTokens     += msg.usage?.output      ?? 0;
     // Refresh the graph live so the in-progress bar updates while streaming.
     widgetTui?.requestRender();
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    if (currentRequestCost > 0) {
+    if (currentRequestCost > 0 || currentInputTokens > 0) {
       records.push({
-        endTime: Date.now(),
-        cost: currentRequestCost,
-        contextTokens: currentContextTokens,
+        endTime:          Date.now(),
+        cost:             currentRequestCost,
+        inputTokens:      currentInputTokens,
+        outputTokens:     currentOutputTokens,
+        cacheWriteTokens: currentCacheWriteTokens,
+        cacheHitTokens:   currentCacheHitTokens,
       });
     }
-    currentRequestCost = 0;
-    currentContextTokens = 0;
+    currentRequestCost      = 0;
+    currentInputTokens      = 0;
+    currentOutputTokens     = 0;
+    currentCacheWriteTokens = 0;
+    currentCacheHitTokens   = 0;
     updateStatus(ctx);
     widgetTui?.requestRender();
   });
@@ -138,9 +164,27 @@ export default function (pi: ExtensionAPI) {
 
   function reconstructFromBranch(ctx: ExtensionContext): RequestRecord[] {
     const result: RequestRecord[] = [];
-    let runCost = 0;
-    let runEndTime = 0;
-    let runContextTokens = 0;
+    let runCost             = 0;
+    let runEndTime          = 0;
+    let runInput            = 0;
+    let runOutput           = 0;
+    let runCacheWrite       = 0;
+    let runCacheHit         = 0;
+
+    function flushRun() {
+      if (runCost > 0 || runInput > 0) {
+        result.push({
+          endTime:          runEndTime,
+          cost:             runCost,
+          inputTokens:      runInput,
+          outputTokens:     runOutput,
+          cacheWriteTokens: runCacheWrite,
+          cacheHitTokens:   runCacheHit,
+        });
+      }
+      runCost = 0; runEndTime = 0;
+      runInput = 0; runOutput = 0; runCacheWrite = 0; runCacheHit = 0;
+    }
 
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "message") continue;
@@ -148,19 +192,17 @@ export default function (pi: ExtensionAPI) {
       const msg = entry.message;
 
       if (msg.role === "user") {
-        // A new user message starts a new agent run. Flush the previous one.
-        if (runCost > 0) {
-          result.push({ endTime: runEndTime, cost: runCost, contextTokens: runContextTokens });
-          runCost = 0;
-          runEndTime = 0;
-          runContextTokens = 0;
-        }
+        flushRun();
       } else if (msg.role === "assistant") {
         const m = msg as AssistantMessage;
-        runCost += m.usage?.cost?.total ?? 0;
-        runEndTime = new Date(entry.timestamp as string | number).getTime();
-        // Overwrite so we keep the last (largest) context size for this run.
-        runContextTokens = m.usage?.input ?? 0;
+        runCost      += m.usage?.cost?.total ?? 0;
+        runEndTime    = new Date(entry.timestamp as string | number).getTime();
+        // Overwrite: later turns have the full accumulated context.
+        runInput      = m.usage?.input       ?? 0;
+        runCacheHit   = m.usage?.cacheRead   ?? 0;
+        runCacheWrite = m.usage?.cacheWrite   ?? 0;
+        // Output accumulates.
+        runOutput    += m.usage?.output      ?? 0;
       }
     }
 
@@ -178,8 +220,5 @@ export default function (pi: ExtensionAPI) {
       parts.map(p => theme.fg(THEME_COLOR[p.style], p.text)).join("  "),
     );
   }
-
-  // formatCost is exported from lib.ts and used in buildDetailReport, but the
-  // extension also needs it for nothing currently — keep the import tidy.
 
 }
