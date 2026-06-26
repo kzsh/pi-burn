@@ -161,7 +161,7 @@ export function buildDetailReport(
     `Session time: ${sessionMinutes.toFixed(1)} min`,
     `Avg /req:     ${formatCost(avgPerReq)}`,
     `Avg /min:     ${formatCost(totalCost / sessionMinutes)}`,
-    `Budget:       $${budget.toFixed(2)}  (yellow ~$${(budget * 0.4).toFixed(2)}, red $${budget.toFixed(2)})`,
+    `Budget:       $${budget.toFixed(2)}  ${burnColor(0.4)}●${ANSI_RESET} $${(budget * 0.4).toFixed(2)}  ${burnColor(1)}●${ANSI_RESET} $${budget.toFixed(2)}`,
   ];
 
   if (records.length >= 2) {
@@ -169,7 +169,7 @@ export function buildDetailReport(
     const last  = records[records.length - 1].cost;
     const multiplier = first > 0 ? last / first : 1;
     lines.push(`First req:    ${formatCost(first)}`);
-    lines.push(`Last req:     ${formatCost(last)}  (${multiplier.toFixed(2)}x first)`);
+    lines.push(`Most recent:  ${formatCost(last)}  (${multiplier.toFixed(2)}x first)`);
   }
 
   if (records.length >= 4) {
