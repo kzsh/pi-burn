@@ -156,17 +156,18 @@ check(
   "(empty)",
 );
 
-// Full cost data → 4 rows, one per type
+// With cost data → always exactly 2 rows (braille top + bottom)
 const fullRecord = withCostSplit({
   endTime: 1, cost: 0.01,
   inputTokens: 10_000, outputTokens: 500, cacheWriteTokens: 1_000, cacheHitTokens: 5_000,
 });
 const fullLines = renderCostGraph([fullRecord], null, 40);
-check("full cost record → 4 rows",  String(fullLines.length), "4");
-check("row 0 label is 'cr '",        fullLines[0]?.slice(0, 3) ?? "", "cr ");
-check("row 1 label is 'in '",        fullLines[1]?.slice(0, 3) ?? "", "in ");
-check("row 2 label is 'cw '",        fullLines[2]?.slice(0, 3) ?? "", "cw ");
-check("row 3 label is 'out'",        fullLines[3]?.slice(0, 3) ?? "", "out");
+const strip = (s: string) => s.replace(/\x1b\[[^m]*m/g, "");
+check("full cost record → 2 rows",          String(fullLines.length), "2");
+check("top row legend contains 'cw'",       strip(fullLines[0] ?? "").includes("cw") ? "yes" : "no", "yes");
+check("top row legend contains 'out'",      strip(fullLines[0] ?? "").includes("out") ? "yes" : "no", "yes");
+check("bottom row legend contains 'cr'",    strip(fullLines[1] ?? "").includes("cr") ? "yes" : "no", "yes");
+check("bottom row legend contains 'in'",    strip(fullLines[1] ?? "").includes("in") ? "yes" : "no", "yes");
 
 // Records without cost fields → no graph
 const noCostRecord: RequestRecord = {
@@ -179,44 +180,51 @@ check(
   "empty",
 );
 
-// Width limits bar count: width=10, label=3 → 7 bars max
-const wideRecords = Array.from({ length: 20 }, (_, i) => withCostSplit({
+// Width: barWidth = max(1, width - LEGEND_W(10)); each braille char = 2 records.
+// At width=20: barWidth=10 chars; stripped row = 10 bars + 10 legend = 20.
+const wideRecords = Array.from({ length: 40 }, (_, i) => withCostSplit({
   endTime: i, cost: 0.005,
   inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 500, cacheHitTokens: i * 1_000,
 }));
-const narrowLines = renderCostGraph(wideRecords, null, 10);
-const narrowBarLen = (narrowLines[0] ?? "").replace(/\x1b\[[^m]*m/g, "").length - 3;
+const narrowLines = renderCostGraph(wideRecords, null, 20);
+const strippedNarrow = strip(narrowLines[0] ?? "");
 check(
-  "width=10 → 7 bars visible",
-  String(narrowBarLen),
-  "7",
+  "width=20 → stripped row length = 20 (10 braille + 10 legend)",
+  String(strippedNarrow.length),
+  "20",
 );
 
-// Live record → last bar dimmed
+// Live record → last braille char is dimmed
 const liveLines = renderCostGraph([SESSION_GROWING[0]!], LIVE, 40);
 check(
-  "live record → last bar is dimmed",
+  "live record → last char is dimmed",
   (liveLines[0] ?? "").includes("\x1b[2m") ? "dim" : "not-dim",
   "dim",
 );
 
-// All-zero cost type rows are suppressed
-const noCacheReadRec: RequestRecord = {
-  endTime: 1, cost: 0.005,
-  inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 500, cacheHitTokens: 0,
-  inputCost: 0.002, outputCost: 0.003, cacheWriteCost: 0.0001, cacheReadCost: 0,
-};
-const suppLines = renderCostGraph([noCacheReadRec], null, 40);
+// showLegend=false → no legend text, full width used for bars
+const noLegendLines = renderCostGraph([fullRecord], null, 20, false);
+const strippedNoLegend = strip(noLegendLines[0] ?? "");
 check(
-  "all-zero cr row is suppressed",
-  suppLines.some(l => l.startsWith("cr ")) ? "shown" : "hidden",
-  "hidden",
+  "showLegend=false → no legend keywords in output",
+  strippedNoLegend.includes("cw") || strippedNoLegend.includes("out") ? "legend" : "no-legend",
+  "no-legend",
 );
 check(
-  "nonzero rows still present when cr is zero",
-  String(suppLines.length),
-  "3",
+  "showLegend=false → stripped row length = width",
+  String(strippedNoLegend.length),
+  "20",
 );
+
+// Padding: 1 record in a wide graph → legend sits at the right edge
+const paddedLines = renderCostGraph([fullRecord], null, 20);
+const strippedPadded = strip(paddedLines[0] ?? "");
+check(
+  "1 record in width=20 → row still fills full width",
+  String(strippedPadded.length),
+  "20",
+);
+
 
 // ── formatCost checks ─────────────────────────────────────────────────────────
 

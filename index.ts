@@ -18,7 +18,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
 import {
   DEFAULT_BUDGET,
   buildDetailReport,
@@ -50,6 +52,7 @@ export default function (pi: ExtensionAPI) {
   let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
+  let showLegend = true;
 
   pi.registerFlag("burn-budget", {
     description: `Session spend limit in dollars at which the graph turns fully red (default: $${DEFAULT_BUDGET})`,
@@ -104,7 +107,7 @@ export default function (pi: ExtensionAPI) {
                 cacheWriteCost:   currentCacheWriteCost,
               }
             : null;
-          return renderCostGraph(records, live, width);
+          return renderCostGraph(records, live, width, showLegend);
         },
         invalidate: () => {},
       };
@@ -170,9 +173,58 @@ export default function (pi: ExtensionAPI) {
   // ── /burn command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("burn", {
-    description: "Show cost burn rate details for this session",
+    description: "Show cost burn rate details and settings for this session",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(buildDetailReport(records, sessionStartTime, budget), "info");
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify(buildDetailReport(records, sessionStartTime, budget), "info");
+        return;
+      }
+
+      const items: SettingItem[] = [
+        {
+          id: "legend",
+          label: "Graph legend",
+          currentValue: showLegend ? "on" : "off",
+          values: ["on", "off"],
+        },
+      ];
+
+      await ctx.ui.custom((tui, theme, _kb, done) => {
+        const reportLines = buildDetailReport(records, sessionStartTime, budget).split("\n");
+
+        const header = new (class {
+          render(_width: number) {
+            return [theme.fg("accent", theme.bold("Burn")), "", ...reportLines, ""];
+          }
+          invalidate() {}
+        })();
+
+        const settingsList = new SettingsList(
+          items,
+          items.length + 2,
+          getSettingsListTheme(),
+          (id, newValue) => {
+            if (id === "legend") {
+              showLegend = newValue === "on";
+              widgetTui?.requestRender();
+            }
+          },
+          () => done(undefined),
+        );
+
+        const container = new Container();
+        container.addChild(header);
+        container.addChild(settingsList);
+
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            settingsList.handleInput?.(data);
+            tui.requestRender();
+          },
+        };
+      });
     },
   });
 

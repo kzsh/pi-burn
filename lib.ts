@@ -46,8 +46,6 @@ function tokenTotal(r: RequestRecord): number {
 //
 // Block characters give 9 height levels (space + ▁▂▃▄▅▆▇█).
 
-const BLOCK_CHARS = " ▁▂▃▄▅▆▇█";
-
 // cr=cyan  in=green  cw=amber  out=orange-red
 const COLOR_CACHE_READ  = "\x1b[38;2;0;180;200m";
 const COLOR_INPUT       = "\x1b[38;2;80;190;80m";
@@ -55,10 +53,52 @@ const COLOR_CACHE_WRITE = "\x1b[38;2;210;170;0m";
 const COLOR_OUTPUT      = "\x1b[38;2;220;80;0m";
 const DIM               = "\x1b[2m";
 
+// Braille dot layout (U+2800 base, one bit per dot):
+//
+//   left  right
+//   dot7  dot8   bit 6 (64),  bit 7 (128)  ← top row
+//   dot3  dot6   bit 2 (4),   bit 5 (32)
+//   dot2  dot5   bit 1 (2),   bit 4 (16)
+//   dot1  dot4   bit 0 (1),   bit 3 (8)    ← bottom row
+//
+// Filling from bottom up:
+//   left column:  dot7(64), dot3(4), dot2(2), dot1(1)
+//   right column: dot8(128), dot6(32), dot5(16), dot4(8)
+
+const COL_LEFT_BITS  = [64, 4, 2, 1] as const;
+const COL_RIGHT_BITS = [128, 32, 16, 8] as const;
+
+function brailleChar(leftHeight: number, rightHeight: number): string {
+  let bits = 0;
+  for (let i = 0; i < leftHeight;  i++) bits |= COL_LEFT_BITS[i]!;
+  for (let i = 0; i < rightHeight; i++) bits |= COL_RIGHT_BITS[i]!;
+  return String.fromCodePoint(0x2800 + bits);
+}
+
+// Stacking order bottom→top: cr  in  cw  out
+// Returns the color for the cost type occupying `dotMid` in record `r`.
+function costZoneColor(dotMid: number, r: RequestRecord, scale: number): string {
+  const z0 = (r.cacheReadCost  ?? 0) * scale;
+  const z1 = z0 + (r.inputCost ?? 0) * scale;
+  const z2 = z1 + (r.cacheWriteCost ?? 0) * scale;
+  if (dotMid < z0) return COLOR_CACHE_READ;
+  if (dotMid < z1) return COLOR_INPUT;
+  if (dotMid < z2) return COLOR_CACHE_WRITE;
+  return COLOR_OUTPUT;
+}
+
+// Legend split across the two braille rows (stacking order, bottom first):
+//   bottom row gets:  ●cr ●in   (the types that occupy the lower height bands)
+//   top row gets:     ●cw ●out  (the types that occupy the upper height bands)
+//
+// Both legends are 10 visible chars: "  \u25cfxx \u25cfyyy" where xxx is padded to match.
+const LEGEND_W = 10; // "  ●xx ●yyy" → 2+1+2+1+1+3 = 10
+
 export function renderCostGraph(
   records: RequestRecord[],
   liveRecord: RequestRecord | null,
   width: number,
+  showLegend = true,
 ): string[] {
   const allData = liveRecord ? [...records, liveRecord] : records;
   if (allData.length === 0) return [];
@@ -69,52 +109,75 @@ export function renderCostGraph(
   );
   if (!hasCosts) return [];
 
-  // Label prefix is 3 chars ("cr ", "in ", "cw ", "out").
-  const LABEL_WIDTH = 3;
-  const barWidth = Math.max(1, width - LABEL_WIDTH);
-  const data = allData.slice(-barWidth);
+  // Each braille char covers 2 data points (left + right column).
+  // Reserve space for the legend only when it is shown.
+  const barWidth = Math.max(1, showLegend ? width - LEGEND_W : width);
+  const data = allData.slice(-(barWidth * 2));
 
-  // Shared scale: max single-type cost across all visible records.
-  const maxVal = Math.max(
+  const maxCost = Math.max(
     1e-9,
-    ...data.flatMap(r => [
-      r.cacheReadCost  ?? 0,
-      r.inputCost      ?? 0,
-      r.cacheWriteCost ?? 0,
-      r.outputCost     ?? 0,
-    ]),
+    ...data.map(r =>
+      (r.cacheReadCost  ?? 0) +
+      (r.inputCost      ?? 0) +
+      (r.cacheWriteCost ?? 0) +
+      (r.outputCost     ?? 0),
+    ),
   );
+  const scale = 8 / maxCost;
 
-  const liveIdx = liveRecord ? data.length - 1 : -1;
+  // Index of the braille char that contains the live record (rightmost char).
+  const liveCharIdx = liveRecord ? Math.ceil(data.length / 2) - 1 : -1;
 
-  function toChar(v: number): string {
-    const level = Math.round((v / maxVal) * 8);
-    return BLOCK_CHARS[Math.max(0, Math.min(8, level))]!;
+  let topLine    = "";
+  let bottomLine = "";
+
+  for (let i = 0; i < data.length; i += 2) {
+    const lastAlone = (data.length % 2 === 1) && (i === data.length - 1);
+    const lRec = lastAlone ? null     : data[i]!;
+    const rRec = lastAlone ? data[i]! : (i + 1 < data.length ? data[i + 1]! : null);
+
+    const totalCost = (r: RequestRecord) =>
+      (r.cacheReadCost ?? 0) + (r.inputCost ?? 0) +
+      (r.cacheWriteCost ?? 0) + (r.outputCost ?? 0);
+
+    const lDots = lRec ? Math.round(totalCost(lRec) * scale) : 0;
+    const rDots = rRec ? Math.round(totalCost(rRec) * scale) : 0;
+
+    const lBot = Math.min(4, lDots);
+    const rBot = Math.min(4, rDots);
+    const lTop = Math.max(0, lDots - 4);
+    const rTop = Math.max(0, rDots - 4);
+
+    // Use the right (newer) record for color, falling back to left.
+    const repRec = rRec ?? lRec!;
+    const charIdx = i / 2;
+    const isLive  = charIdx === liveCharIdx;
+
+    const rBotMid = rBot / 2;
+    const botColor = (lBot > 0 || rBot > 0) ? costZoneColor(rBotMid, repRec, scale) : "";
+    const rTopMid = 4 + rTop / 2;
+    const topColor = (lTop > 0 || rTop > 0) ? costZoneColor(rTopMid, repRec, scale) : "";
+
+    const topCh = (lTop > 0 || rTop > 0) ? topColor + brailleChar(lTop, rTop) + ANSI_RESET : " ";
+    const botCh = (lBot > 0 || rBot > 0) ? botColor + brailleChar(lBot, rBot) + ANSI_RESET
+                                          : brailleChar(0, 0);
+
+    topLine    += isLive ? DIM + topCh + ANSI_RESET : topCh;
+    bottomLine += isLive ? DIM + botCh + ANSI_RESET : botCh;
   }
 
-  function makeRow(
-    label: string,
-    color: string,
-    getter: (r: RequestRecord) => number,
-  ): string | null {
-    const values = data.map(getter);
-    if (values.every(v => v === 0)) return null;
-    let row = label;
-    for (let i = 0; i < data.length; i++) {
-      const ch = toChar(values[i]!);
-      row += i === liveIdx
-        ? `${DIM}${ch}${ANSI_RESET}`
-        : `${color}${ch}${ANSI_RESET}`;
-    }
-    return row;
+  // Left-pad bars so the legend is always flush at the right edge.
+  const charCount = Math.ceil(data.length / 2);
+  const pad = " ".repeat(Math.max(0, barWidth - charCount));
+
+  if (!showLegend) {
+    return [pad + topLine, pad + bottomLine];
   }
 
-  return [
-    makeRow("cr ", COLOR_CACHE_READ,  r => r.cacheReadCost  ?? 0),
-    makeRow("in ", COLOR_INPUT,       r => r.inputCost      ?? 0),
-    makeRow("cw ", COLOR_CACHE_WRITE, r => r.cacheWriteCost ?? 0),
-    makeRow("out", COLOR_OUTPUT,      r => r.outputCost     ?? 0),
-  ].filter((row): row is string => row !== null);
+  const topLegend = `  ${COLOR_CACHE_WRITE}\u25cf${ANSI_RESET}cw ${COLOR_OUTPUT}\u25cf${ANSI_RESET}out`;
+  const botLegend = `  ${COLOR_CACHE_READ}\u25cf${ANSI_RESET}cr ${COLOR_INPUT}\u25cf${ANSI_RESET}in `;
+
+  return [pad + topLine + topLegend, pad + bottomLine + botLegend];
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -159,11 +222,11 @@ export function buildStatusParts(records: RequestRecord[]): StatusPart[] {
 
       const fmt = (n: number) => `$${n.toFixed(3)}`;
       const breakdown = [
-        avgCacheRead  > 0 ? `cr:${fmt(avgCacheRead)}`  : null,
-        avgInput      > 0 ? `in:${fmt(avgInput)}`      : null,
-        avgCacheWrite > 0 ? `cw:${fmt(avgCacheWrite)}` : null,
-        avgOutput     > 0 ? `out:${fmt(avgOutput)}`    : null,
-      ].filter(Boolean).join("  ");
+        `cr:${fmt(avgCacheRead)}`,
+        `in:${fmt(avgInput)}`,
+        `cw:${fmt(avgCacheWrite)}`,
+        `out:${fmt(avgOutput)}`,
+      ].join("  ");
 
       if (breakdown) {
         parts.push({ text: breakdown, style: "dim" });
