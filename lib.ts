@@ -6,57 +6,19 @@
 // ($4 on the default $10 budget); at 100% it turns fully red.
 export const DEFAULT_BUDGET = 10;
 
-export type GraphBarDebug = {
-  total:      number;
-  cacheHit:   number;
-  input:      number;
-  cacheWrite: number;
-  output:     number;
-  dots:       number;  // 0–8, scaled bar height
-  botDots:    number;  // 0–4, lower braille row
-  topDots:    number;  // 0–4, upper braille row
-};
-
-export type GraphDebug = {
-  timestamp: string;
-  maxTotal:  number;
-  scale:     number;
-  bars:      GraphBarDebug[];
-};
-
 export type RequestRecord = {
   endTime: number;       // ms epoch
-  cost: number;          // USD
+  cost: number;          // USD total
   inputTokens: number;   // non-cached input tokens for the run
   outputTokens: number;  // total output tokens for the run
   cacheWriteTokens: number;
   cacheHitTokens: number;
+  // Per-type cost breakdown; all four sum to `cost`.
+  inputCost?: number;
+  outputCost?: number;
+  cacheReadCost?: number;
+  cacheWriteCost?: number;
 };
-
-// ── Braille helpers ──────────────────────────────────────────────────────────
-//
-// Braille Unicode dot layout (U+2800 base, one bit per dot):
-//
-//   left  right
-//   ────  ─────
-//   dot1  dot4   bit 0 (1),   bit 3 (8)
-//   dot2  dot5   bit 1 (2),   bit 4 (16)
-//   dot3  dot6   bit 2 (4),   bit 5 (32)
-//   dot7  dot8   bit 6 (64),  bit 7 (128)
-//
-// To fill a column as a bar from the bottom up we light dots in this order:
-//   left  column: dot7(64), dot3(4), dot2(2), dot1(1)
-//   right column: dot8(128), dot6(32), dot5(16), dot4(8)
-
-const COL_LEFT_BITS  = [64, 4, 2, 1] as const;
-const COL_RIGHT_BITS = [128, 32, 16, 8] as const;
-
-export function brailleChar(leftHeight: number, rightHeight: number): string {
-  let bits = 0;
-  for (let i = 0; i < leftHeight;  i++) bits |= COL_LEFT_BITS[i]!;
-  for (let i = 0; i < rightHeight; i++) bits |= COL_RIGHT_BITS[i]!;
-  return String.fromCodePoint(0x2800 + bits);
-}
 
 // t=0 => green, t=0.4 => yellow, t=1 => red
 export function burnColor(t: number): string {
@@ -67,131 +29,92 @@ export function burnColor(t: number): string {
 
 const ANSI_RESET = "\x1b[0m";
 
-// ── Token type colors ────────────────────────────────────────────────────────
-//
-// Stacking order in the bar, bottom to top:
-//   cacheHit (cheapest)  →  input  →  cacheWrite  →  output (priciest)
-//
-const COLOR_CACHE_HIT   = "\x1b[38;2;0;180;200m";   // cyan
-const COLOR_INPUT       = "\x1b[38;2;80;190;80m";    // green
-const COLOR_CACHE_WRITE = "\x1b[38;2;210;170;0m";    // amber
-const COLOR_OUTPUT      = "\x1b[38;2;220;80;0m";     // orange-red
-
 function tokenTotal(r: RequestRecord): number {
   return r.inputTokens + r.outputTokens + r.cacheWriteTokens + r.cacheHitTokens;
 }
 
-// Given a vertical midpoint `dotMid` in 0-8 dot space and a scale factor
-// (scale = 8 / maxTotal across visible window), return the ANSI color for the
-// token zone occupying that position in record `r`'s stacked bar.
-function tokenZoneColor(dotMid: number, r: RequestRecord, scale: number): string {
-  const z0 = r.cacheHitTokens * scale;
-  const z1 = (r.cacheHitTokens + r.inputTokens) * scale;
-  const z2 = (r.cacheHitTokens + r.inputTokens + r.cacheWriteTokens) * scale;
-  if (dotMid < z0) return COLOR_CACHE_HIT;
-  if (dotMid < z1) return COLOR_INPUT;
-  if (dotMid < z2) return COLOR_CACHE_WRITE;
-  return COLOR_OUTPUT;
-}
-
 // ── Graph ─────────────────────────────────────────────────────────────────────
 //
-// Returns two lines: [topRow, bottomRow].  Each column encodes two adjacent
-// data points as a single braille character (left = older, right = newer).
+// Returns one row per cost type (cr, in, cw, out), each a labeled sparkline
+// of that cost across round trips.  Rows are omitted when all values are zero.
 //
-// Bar HEIGHT represents total tokens for that request (input + output +
-// cache_write + cache_hit), scaled to the session max.  Two rows of braille
-// give 8 dot levels of resolution so small changes are visible.
+// All four rows share the same scale (based on the per-type max across the
+// visible window) so relative heights are directly comparable.
 //
-// Bar COLOR shows the token breakdown as a stacked bar:
-//   bottom → top:  cacheHit (cyan)  input (green)  cacheWrite (amber)  output (orange)
+// Pass a partial `liveRecord` for the current in-flight request; its bar
+// appears dim at the right edge while the request is still streaming.
 //
-// Pass a partial `liveRecord` built from the current in-flight request to show
-// a live bar at the right edge while the request is streaming.
-//
-export function renderBurnGraph(
+// Block characters give 9 height levels (space + ▁▂▃▄▅▆▇█).
+
+const BLOCK_CHARS = " ▁▂▃▄▅▆▇█";
+
+// cr=cyan  in=green  cw=amber  out=orange-red
+const COLOR_CACHE_READ  = "\x1b[38;2;0;180;200m";
+const COLOR_INPUT       = "\x1b[38;2;80;190;80m";
+const COLOR_CACHE_WRITE = "\x1b[38;2;210;170;0m";
+const COLOR_OUTPUT      = "\x1b[38;2;220;80;0m";
+const DIM               = "\x1b[2m";
+
+export function renderCostGraph(
   records: RequestRecord[],
   liveRecord: RequestRecord | null,
   width: number,
-  debugOut?: (d: GraphDebug) => void,
 ): string[] {
   const allData = liveRecord ? [...records, liveRecord] : records;
   if (allData.length === 0) return [];
 
-  // Most-recent slice that fits the terminal width (2 data points per char).
-  const data = allData.slice(-(width * 2));
+  const hasCosts = allData.some(
+    r => r.inputCost != null || r.outputCost != null ||
+         r.cacheReadCost != null || r.cacheWriteCost != null,
+  );
+  if (!hasCosts) return [];
 
-  const maxTotal = Math.max(1, ...data.map(tokenTotal));
-  const scale    = 8 / maxTotal; // maps token count → 0-8 dot space
+  // Label prefix is 3 chars ("cr ", "in ", "cw ", "out").
+  const LABEL_WIDTH = 3;
+  const barWidth = Math.max(1, width - LABEL_WIDTH);
+  const data = allData.slice(-barWidth);
 
-  if (debugOut) {
-    debugOut({
-      timestamp: new Date().toISOString(),
-      maxTotal,
-      scale,
-      bars: data.map(r => {
-        const total = tokenTotal(r);
-        const dots  = Math.round(total * scale);
-        return {
-          total,
-          cacheHit:   r.cacheHitTokens,
-          input:      r.inputTokens,
-          cacheWrite: r.cacheWriteTokens,
-          output:     r.outputTokens,
-          dots,
-          botDots: Math.min(4, dots),
-          topDots: Math.max(0, dots - 4),
-        };
-      }),
-    });
+  // Shared scale: max single-type cost across all visible records.
+  const maxVal = Math.max(
+    1e-9,
+    ...data.flatMap(r => [
+      r.cacheReadCost  ?? 0,
+      r.inputCost      ?? 0,
+      r.cacheWriteCost ?? 0,
+      r.outputCost     ?? 0,
+    ]),
+  );
+
+  const liveIdx = liveRecord ? data.length - 1 : -1;
+
+  function toChar(v: number): string {
+    const level = Math.round((v / maxVal) * 8);
+    return BLOCK_CHARS[Math.max(0, Math.min(8, level))]!;
   }
 
-  // Pair bars left-to-right: (0,1)(2,3)…  When the count is odd the newest
-  // bar sits alone in the right column of the last character, with the left
-  // column empty.  This keeps every historical pair stable — adding one new
-  // bar only touches the rightmost character, never shifts the whole graph.
-  let topLine    = "";
-  let bottomLine = "";
-
-  for (let i = 0; i < data.length; i += 2) {
-    const lastAlone = (data.length % 2 === 1) && (i === data.length - 1);
-    const lRec = lastAlone ? null     : data[i]!;
-    const rRec = lastAlone ? data[i]! : (i + 1 < data.length ? data[i + 1]! : null);
-
-    const lDots = lRec ? Math.round(tokenTotal(lRec) * scale) : 0;
-    const rDots = rRec ? Math.round(tokenTotal(rRec) * scale) : 0;
-
-    // Bottom row: lower 4 dots of each sub-column bar
-    const lBot = Math.min(4, lDots);
-    const rBot = Math.min(4, rDots);
-    // Top row: upper 4 dots (only present when bar exceeds 4 dots)
-    const lTop = Math.max(0, lDots - 4);
-    const rTop = Math.max(0, rDots - 4);
-
-    // Color representative for the char: prefer the right (newer) record.
-    const repRec = rRec ?? lRec!;
-
-    // Bottom-row color: midpoint of the right sub-column's fill in that row.
-    const rBotMid = rBot / 2;
-    const botColor = (lBot > 0 || rBot > 0)
-      ? tokenZoneColor(rBotMid, repRec, scale)
-      : "";
-
-    // Top-row color: midpoint of the right sub-column's fill, offset by 4.
-    const rTopMid = 4 + rTop / 2;
-    const topColor = (lTop > 0 || rTop > 0)
-      ? tokenZoneColor(rTopMid, repRec, scale)
-      : "";
-
-    topLine += (lTop > 0 || rTop > 0)
-      ? topColor + brailleChar(lTop, rTop) + ANSI_RESET
-      : " ";
-    bottomLine += (lBot > 0 || rBot > 0)
-      ? botColor + brailleChar(lBot, rBot) + ANSI_RESET
-      : brailleChar(0, 0); // empty braille for alignment
+  function makeRow(
+    label: string,
+    color: string,
+    getter: (r: RequestRecord) => number,
+  ): string | null {
+    const values = data.map(getter);
+    if (values.every(v => v === 0)) return null;
+    let row = label;
+    for (let i = 0; i < data.length; i++) {
+      const ch = toChar(values[i]!);
+      row += i === liveIdx
+        ? `${DIM}${ch}${ANSI_RESET}`
+        : `${color}${ch}${ANSI_RESET}`;
+    }
+    return row;
   }
 
-  return [topLine, bottomLine];
+  return [
+    makeRow("cr ", COLOR_CACHE_READ,  r => r.cacheReadCost  ?? 0),
+    makeRow("in ", COLOR_INPUT,       r => r.inputCost      ?? 0),
+    makeRow("cw ", COLOR_CACHE_WRITE, r => r.cacheWriteCost ?? 0),
+    makeRow("out", COLOR_OUTPUT,      r => r.outputCost     ?? 0),
+  ].filter((row): row is string => row !== null);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -219,6 +142,33 @@ export function buildStatusParts(records: RequestRecord[]): StatusPart[] {
     const window = records.slice(-3);
     const windowAvg = window.reduce((s, r) => s + r.cost, 0) / window.length;
     parts.push({ text: `${formatCost(windowAvg)}/req`, style: "muted" });
+
+    const hasCostBreakdown = window.some(
+      r => r.inputCost != null || r.outputCost != null ||
+           r.cacheReadCost != null || r.cacheWriteCost != null,
+    );
+
+    if (hasCostBreakdown) {
+      const avg = (fn: (r: RequestRecord) => number | undefined) =>
+        window.reduce((s, r) => s + (fn(r) ?? 0), 0) / window.length;
+
+      const avgCacheRead  = avg(r => r.cacheReadCost);
+      const avgInput      = avg(r => r.inputCost);
+      const avgCacheWrite = avg(r => r.cacheWriteCost);
+      const avgOutput     = avg(r => r.outputCost);
+
+      const fmt = (n: number) => `$${n.toFixed(3)}`;
+      const breakdown = [
+        avgCacheRead  > 0 ? `cr:${fmt(avgCacheRead)}`  : null,
+        avgInput      > 0 ? `in:${fmt(avgInput)}`      : null,
+        avgCacheWrite > 0 ? `cw:${fmt(avgCacheWrite)}` : null,
+        avgOutput     > 0 ? `out:${fmt(avgOutput)}`    : null,
+      ].filter(Boolean).join("  ");
+
+      if (breakdown) {
+        parts.push({ text: breakdown, style: "dim" });
+      }
+    }
   }
 
   if (records.length >= 4) {
@@ -287,3 +237,5 @@ export function buildDetailReport(
 export function formatCost(usd: number): string {
   return `$${usd.toFixed(4)}`;
 }
+
+

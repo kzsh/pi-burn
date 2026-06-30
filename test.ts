@@ -9,13 +9,32 @@ import {
   DEFAULT_BUDGET,
   buildDetailReport,
   buildStatusParts,
-  brailleChar,
-  burnColor,
   formatCost,
-  renderBurnGraph,
+  renderCostGraph,
   type RequestRecord,
   type StatusStyle,
 } from "./lib.ts";
+
+// Splits a record's total cost across token types using Anthropic-style pricing
+// weights (output costs ~5x input, cacheWrite ~1.25x, cacheRead ~0.1x).
+// Used to generate realistic per-type cost fields for test fixtures.
+function withCostSplit(r: Omit<RequestRecord, 'inputCost'|'outputCost'|'cacheReadCost'|'cacheWriteCost'>): RequestRecord {
+  const INPUT_W = 1, OUTPUT_W = 5, CW_W = 1.25, CR_W = 0.1;
+  const denom =
+    r.inputTokens * INPUT_W +
+    r.outputTokens * OUTPUT_W +
+    r.cacheWriteTokens * CW_W +
+    r.cacheHitTokens * CR_W;
+  if (denom === 0) return { ...r, inputCost: 0, outputCost: 0, cacheReadCost: 0, cacheWriteCost: 0 };
+  const u = r.cost / denom;
+  return {
+    ...r,
+    inputCost:      u * r.inputTokens * INPUT_W,
+    outputCost:     u * r.outputTokens * OUTPUT_W,
+    cacheWriteCost: u * r.cacheWriteTokens * CW_W,
+    cacheReadCost:  u * r.cacheHitTokens * CR_W,
+  };
+}
 
 // ── Simple ANSI helpers for the test output ───────────────────────────────────
 // These approximate what pi's theme.fg() does for each StatusStyle.
@@ -40,7 +59,7 @@ function graph(
   liveRecord: RequestRecord | null = null,
   width = 40,
 ): string {
-  const lines = renderBurnGraph(records, liveRecord, width);
+  const lines = renderCostGraph(records, liveRecord, width);
   return lines.join("\n") || "(empty)";
 }
 
@@ -89,10 +108,10 @@ const SESSION_GROWING: RequestRecord[] = [
   { endTime:  8, cost: 0.010, inputTokens: 130_000, outputTokens: 2_000, cacheWriteTokens:  5_000, cacheHitTokens: 110_000 },
   { endTime:  9, cost: 0.015, inputTokens: 148_000, outputTokens: 3_000, cacheWriteTokens:  5_000, cacheHitTokens: 130_000 },
   { endTime: 10, cost: 0.014, inputTokens: 155_000, outputTokens: 2_800, cacheWriteTokens:  5_000, cacheHitTokens: 148_000 },
-];
+].map(withCostSplit);
 
 // Uniform cost, growing context — bars grow steadily without spending variance.
-const SESSION_FLAT_COST: RequestRecord[] = Array.from({ length: 10 }, (_, i) => ({
+const SESSION_FLAT_COST: RequestRecord[] = Array.from({ length: 10 }, (_, i) => withCostSplit({
   endTime:          i + 1,
   cost:             0.005,
   inputTokens:      (i + 1) * 15_000,
@@ -108,116 +127,96 @@ const SESSION_SPIKE: RequestRecord[] = [
   { endTime: 3, cost: 0.030, inputTokens:  60_000, outputTokens: 8_000, cacheWriteTokens:  5_000, cacheHitTokens: 40_000 }, // spike
   { endTime: 4, cost: 0.004, inputTokens:  80_000, outputTokens: 1_000, cacheWriteTokens:  5_000, cacheHitTokens: 60_000 },
   { endTime: 5, cost: 0.005, inputTokens: 100_000, outputTokens: 1_200, cacheWriteTokens:  5_000, cacheHitTokens: 80_000 },
-];
+].map(withCostSplit);
 
 // ── Graph visual tests ────────────────────────────────────────────────────────
 
-section("Graph — visual (braille + color, 2 rows)");
+section("Graph — visual (cost sparklines, 4 rows)");
 
-const LIVE: RequestRecord = {
+const LIVE: RequestRecord = withCostSplit({
   endTime: Date.now(), cost: 0.008,
   inputTokens: 40_000, outputTokens: 1_500, cacheWriteTokens: 5_000, cacheHitTokens: 20_000,
-};
+});
 
-show("Growing session (taller → more cache →)",   graph(SESSION_GROWING));
-show("Flat cost, growing ctx",                     graph(SESSION_FLAT_COST));
-show("Cost spike (tall bar in middle)",            graph(SESSION_SPIKE));
-show("1 record",                                  graph([SESSION_GROWING[0]!]));
-show("No records",                                graph([]));
-show("Live bar, no history",                      graph([], LIVE));
-show("Live bar mid-session",                      graph(SESSION_GROWING.slice(0, 5), LIVE));
+show("Growing session",        graph(SESSION_GROWING));
+show("Flat cost, growing ctx", graph(SESSION_FLAT_COST));
+show("Cost spike (mid)",       graph(SESSION_SPIKE));
+show("1 record",               graph([SESSION_GROWING[0]!]));
+show("No records",             graph([]));
+show("Live bar, no history",   graph([], LIVE));
+show("Live bar mid-session",   graph(SESSION_GROWING.slice(0, 5), LIVE));
 
-// ── Graph correctness checks ──────────────────────────────────────────────────
+// ── Graph correctness checks ──────────────────────────────────────────────────────────────
 
 section("Graph — correctness checks");
 
-// Empty input → empty
 check(
   "empty records, no live → empty",
-  renderBurnGraph([], null, 40)[0] ?? "(empty)",
+  graph([]),
   "(empty)",
 );
 
-// renderBurnGraph always returns 2 lines when there is data
-const twoRowLines = renderBurnGraph([SESSION_GROWING[0]!], null, 40);
-check(
-  "single record → 2-element array",
-  String(twoRowLines.length),
-  "2",
-);
-
-// Single record: bottom row has only the right column lit (left is padding)
-const bottomRow = twoRowLines[1] ?? "";
-const strippedBottom = bottomRow.replace(/\x1b\[[^m]*m/g, "");
-check(
-  "single record → bottom row is a braille char",
-  (strippedBottom.codePointAt(0) ?? 0) >= 0x2800 && (strippedBottom.codePointAt(0) ?? 0) <= 0x28ff
-    ? "braille"
-    : "not-braille",
-  "braille",
-);
-const charCode = (strippedBottom.codePointAt(0) ?? 0x2800) - 0x2800;
-check(
-  "single record → left column dots are all zero (right-column padding)",
-  String(charCode & (1 | 2 | 4 | 64)),
-  "0",
-);
-
-// burnColor clamping still works
-check(
-  "burnColor(>1) clamps to burnColor(1)",
-  burnColor(Math.min(1.5, 1)),
-  burnColor(1),
-);
-
-// A record with all-zero tokens still renders (bar at 0 height, but 2 rows returned)
-const zeroTokenRec: RequestRecord = {
-  endTime: 1, cost: 0,
-  inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheHitTokens: 0,
-};
-check(
-  "zero token record → still returns 2 rows",
-  String(renderBurnGraph([zeroTokenRec], null, 40).length),
-  "2",
-);
-
-// A record with tokens renders a non-empty bar in the bottom row
-const tallRec: RequestRecord = {
+// Full cost data → 4 rows, one per type
+const fullRecord = withCostSplit({
   endTime: 1, cost: 0.01,
-  inputTokens: 10_000, outputTokens: 500, cacheWriteTokens: 1_000, cacheHitTokens: 0,
+  inputTokens: 10_000, outputTokens: 500, cacheWriteTokens: 1_000, cacheHitTokens: 5_000,
+});
+const fullLines = renderCostGraph([fullRecord], null, 40);
+check("full cost record → 4 rows",  String(fullLines.length), "4");
+check("row 0 label is 'cr '",        fullLines[0]?.slice(0, 3) ?? "", "cr ");
+check("row 1 label is 'in '",        fullLines[1]?.slice(0, 3) ?? "", "in ");
+check("row 2 label is 'cw '",        fullLines[2]?.slice(0, 3) ?? "", "cw ");
+check("row 3 label is 'out'",        fullLines[3]?.slice(0, 3) ?? "", "out");
+
+// Records without cost fields → no graph
+const noCostRecord: RequestRecord = {
+  endTime: 1, cost: 0.01,
+  inputTokens: 10_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0,
 };
-const tallLines = renderBurnGraph([tallRec], null, 40);
-const tallBottom = (tallLines[1] ?? "").replace(/\x1b\[[^m]*m/g, "");
 check(
-  "token record → bottom row has a filled braille char",
-  ((tallBottom.codePointAt(0) ?? 0x2800) - 0x2800) > 0 ? "filled" : "empty",
-  "filled",
+  "records without cost fields → empty",
+  renderCostGraph([noCostRecord], null, 40).length === 0 ? "empty" : "non-empty",
+  "empty",
 );
 
-// Taller session fills the top row too
-const maxRec: RequestRecord = {
-  endTime: 1, cost: 0.05,
-  inputTokens: 200_000, outputTokens: 5_000, cacheWriteTokens: 10_000, cacheHitTokens: 50_000,
-};
-const maxLines = renderBurnGraph([maxRec], null, 40);
-const maxTop    = (maxLines[0] ?? "").replace(/\x1b\[[^m]*m/g, "").trim();
+// Width limits bar count: width=10, label=3 → 7 bars max
+const wideRecords = Array.from({ length: 20 }, (_, i) => withCostSplit({
+  endTime: i, cost: 0.005,
+  inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 500, cacheHitTokens: i * 1_000,
+}));
+const narrowLines = renderCostGraph(wideRecords, null, 10);
+const narrowBarLen = (narrowLines[0] ?? "").replace(/\x1b\[[^m]*m/g, "").length - 3;
 check(
-  "max-height record → top row is non-empty",
-  maxTop.length > 0 ? "non-empty" : "empty",
-  "non-empty",
+  "width=10 → 7 bars visible",
+  String(narrowBarLen),
+  "7",
 );
 
-// ── Braille char checks ───────────────────────────────────────────────────────
+// Live record → last bar dimmed
+const liveLines = renderCostGraph([SESSION_GROWING[0]!], LIVE, 40);
+check(
+  "live record → last bar is dimmed",
+  (liveLines[0] ?? "").includes("\x1b[2m") ? "dim" : "not-dim",
+  "dim",
+);
 
-section("brailleChar — known values");
-
-check("(0,0) → empty braille ⠀",   brailleChar(0, 0), "⠀");
-check("(4,4) → full block ⣿",      brailleChar(4, 4), "⣿");
-check("(4,0) → left col only ⡇",   brailleChar(4, 0), "⡇");
-check("(0,4) → right col only ⢸",  brailleChar(0, 4), "⢸");
-check("(1,1) → bottom row ⣀",      brailleChar(1, 1), "⣀");
-check("(2,2) → bottom 2 rows ⣤",   brailleChar(2, 2), "⣤");
-check("(3,3) → bottom 3 rows ⣶",   brailleChar(3, 3), "⣶");
+// All-zero cost type rows are suppressed
+const noCacheReadRec: RequestRecord = {
+  endTime: 1, cost: 0.005,
+  inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 500, cacheHitTokens: 0,
+  inputCost: 0.002, outputCost: 0.003, cacheWriteCost: 0.0001, cacheReadCost: 0,
+};
+const suppLines = renderCostGraph([noCacheReadRec], null, 40);
+check(
+  "all-zero cr row is suppressed",
+  suppLines.some(l => l.startsWith("cr ")) ? "shown" : "hidden",
+  "hidden",
+);
+check(
+  "nonzero rows still present when cr is zero",
+  String(suppLines.length),
+  "3",
+);
 
 // ── formatCost checks ─────────────────────────────────────────────────────────
 
@@ -250,7 +249,7 @@ const emptyParts = buildStatusParts([]);
 check("empty → 0 parts",              String(emptyParts.length), "0");
 
 const oneParts = buildStatusParts([SESSION_GROWING[0]!]);
-check("1 record → 1 part",            String(oneParts.length), "1");
+check("1 record → 2 parts",            String(oneParts.length), "2");
 check("1 record → muted /req part",   oneParts[0]?.style ?? "", "muted");
 
 // Cost accumulation: 4 records, early cheaper than recent → warning multiplier
@@ -259,19 +258,19 @@ const accelRecords: RequestRecord[] = [
   { endTime: 2, cost: 0.001, inputTokens: 2_000, outputTokens: 100, cacheWriteTokens: 0, cacheHitTokens: 0 },
   { endTime: 3, cost: 0.005, inputTokens: 3_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0 },
   { endTime: 4, cost: 0.005, inputTokens: 4_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0 },
-];
+].map(withCostSplit);
 const accelParts = buildStatusParts(accelRecords);
-check("accel → 2 parts",              String(accelParts.length), "2");
-check("accel → last part is warning", accelParts[1]?.style ?? "", "warning");
-check("accel → multiplier shown",     accelParts[1]?.text.startsWith("+") ?? false ? "yes" : "no", "yes");
+check("accel → 3 parts",              String(accelParts.length), "3");
+check("accel → last part is warning", accelParts[2]?.style ?? "", "warning");
+check("accel → multiplier shown",     accelParts[2]?.text.startsWith("+") ?? false ? "yes" : "no", "yes");
 
 // Stable: all equal cost → no multiplier annotation
-const stableRecords: RequestRecord[] = Array.from({ length: 4 }, (_, i) => ({
+const stableRecords: RequestRecord[] = Array.from({ length: 4 }, (_, i) => withCostSplit({
   endTime: i, cost: 0.005,
   inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0,
 }));
 const stableParts = buildStatusParts(stableRecords);
-check("stable cost → 1 part (no multiplier)", String(stableParts.length), "1");
+check("stable cost → 2 parts (no multiplier)", String(stableParts.length), "2");
 
 // Declining cost → success style
 const decliningRecords: RequestRecord[] = [
@@ -279,9 +278,34 @@ const decliningRecords: RequestRecord[] = [
   { endTime: 2, cost: 0.010, inputTokens: 10_000, outputTokens: 1_000, cacheWriteTokens: 0, cacheHitTokens: 0 },
   { endTime: 3, cost: 0.001, inputTokens:  1_000, outputTokens:   100, cacheWriteTokens: 0, cacheHitTokens: 0 },
   { endTime: 4, cost: 0.001, inputTokens:  1_000, outputTokens:   100, cacheWriteTokens: 0, cacheHitTokens: 0 },
-];
+].map(withCostSplit);
 const decliningParts = buildStatusParts(decliningRecords);
-check("declining → last part is success",      decliningParts[1]?.style ?? "", "success");
+check("declining → last part is success",      decliningParts[2]?.style ?? "", "success");
+
+// Cost breakdown: verify per-type costs appear and are individually correct
+const breakdownRec: RequestRecord = {
+  endTime: 1, cost: 0.020,
+  inputTokens: 10_000, outputTokens: 2_000, cacheWriteTokens: 4_000, cacheHitTokens: 50_000,
+  inputCost: 0.003, outputCost: 0.015, cacheWriteCost: 0.001, cacheReadCost: 0.001,
+};
+const breakdownParts = buildStatusParts([breakdownRec]);
+const breakdownText  = breakdownParts[1]?.text ?? "";
+check("breakdown part is dim",          breakdownParts[1]?.style ?? "", "dim");
+check("breakdown contains cr cost",     breakdownText.includes("cr:") ? "yes" : "no", "yes");
+check("breakdown contains in cost",     breakdownText.includes("in:") ? "yes" : "no", "yes");
+check("breakdown contains cw cost",     breakdownText.includes("cw:") ? "yes" : "no", "yes");
+check("breakdown contains out cost",    breakdownText.includes("out:") ? "yes" : "no", "yes");
+check("breakdown cr value",             breakdownText.match(/cr:(\S+)/)?.[1] ?? "", "$0.001");
+check("breakdown in value",             breakdownText.match(/in:(\S+)/)?.[1] ?? "", "$0.003");
+check("breakdown cw value",             breakdownText.match(/cw:(\S+)/)?.[1] ?? "", "$0.001");
+check("breakdown out value",            breakdownText.match(/out:(\S+)/)?.[1] ?? "", "$0.015");
+// Records without per-type costs still show no breakdown part
+const noBreakdownRec: RequestRecord = {
+  endTime: 1, cost: 0.005,
+  inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 0, cacheHitTokens: 0,
+};
+const noBreakdownParts = buildStatusParts([noBreakdownRec]);
+check("no cost fields → only 1 part",   String(noBreakdownParts.length), "1");
 
 // ── Detail report ─────────────────────────────────────────────────────────────
 

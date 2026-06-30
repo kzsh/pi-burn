@@ -4,44 +4,29 @@
  * Tracks cost per request over time, surfacing the acceleration in spend
  * as context grows. Think: meters per second per second, but for dollars.
  *
- * Status bar format:
- *   $0.0420  $0.013/req  +2.1x
- *   |         |            |
- *   total     recent avg   cost multiplier (how much more expensive
- *             per request  recent reqs are vs early ones)
+ * Status bar:
+ *   $0.013/req  cr:$0.001  in:$0.011  cw:$0.000  out:$0.001  +2.1x
+ *   |            |                                             |
+ *   recent avg   per-type cost breakdown (3-req window)       cost multiplier
  *
  * The multiplier only appears after 4+ requests (need enough data to
  * split into early vs recent halves meaningfully).
  *
  * Widget (above editor):
- *   Two-row braille sparkline, left = oldest request, right = newest.
- *
- *   Bar HEIGHT: total tokens (input + output + cache_write + cache_hit) for
- *               that request, scaled to the session max across the visible
- *               window.  Two rows of braille = 8 dot levels of resolution.
- *
- *   Bar COLOR:  stacked by token type, bottom → top:
- *               cyan  = cache_hit   (cheapest per token)
- *               green = input
- *               amber = cache_write
- *               orange = output     (most expensive per token)
+ *   One sparkline row per cost type (cr/in/cw/out), each showing that
+ *   type's cost across round trips on a shared scale.
  */
 
-import { appendFileSync } from "fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   DEFAULT_BUDGET,
   buildDetailReport,
   buildStatusParts,
-  renderBurnGraph,
-  type GraphDebug,
+  renderCostGraph,
   type RequestRecord,
   type StatusStyle,
 } from "./lib.ts";
-
-const PI_BURN_DEBUG = !!process.env["PI_BURN_DEBUG"];
-const DEBUG_LOG     = "/tmp/pi-burn-graph.log";
 
 // pi's theme color names that correspond to our StatusStyle values.
 const THEME_COLOR: Record<StatusStyle, string> = {
@@ -58,10 +43,13 @@ export default function (pi: ExtensionAPI) {
   let currentOutputTokens   = 0;
   let currentCacheWriteTokens = 0;
   let currentCacheHitTokens   = 0;
+  let currentInputCost      = 0;
+  let currentOutputCost     = 0;
+  let currentCacheReadCost  = 0;
+  let currentCacheWriteCost = 0;
   let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
-  let lastGraphDebug: GraphDebug | null = null;
 
   pi.registerFlag("burn-budget", {
     description: `Session spend limit in dollars at which the graph turns fully red (default: $${DEFAULT_BUDGET})`,
@@ -76,6 +64,10 @@ export default function (pi: ExtensionAPI) {
     currentOutputTokens     = 0;
     currentCacheWriteTokens = 0;
     currentCacheHitTokens   = 0;
+    currentInputCost      = 0;
+    currentOutputCost     = 0;
+    currentCacheReadCost  = 0;
+    currentCacheWriteCost = 0;
     sessionStartTime = Date.now();
 
     // CLI flags are not available during the factory; read them here instead.
@@ -102,16 +94,17 @@ export default function (pi: ExtensionAPI) {
             ? {
                 endTime:          Date.now(),
                 cost:             currentRequestCost,
-                        inputTokens:      currentInputTokens,
+                inputTokens:      currentInputTokens,
                 outputTokens:     currentOutputTokens,
                 cacheWriteTokens: currentCacheWriteTokens,
                 cacheHitTokens:   currentCacheHitTokens,
+                inputCost:        currentInputCost,
+                outputCost:       currentOutputCost,
+                cacheReadCost:    currentCacheReadCost,
+                cacheWriteCost:   currentCacheWriteCost,
               }
             : null;
-          return renderBurnGraph(records, live, width, PI_BURN_DEBUG ? (d) => {
-            lastGraphDebug = d;
-            appendFileSync(DEBUG_LOG, formatGraphDebug(d));
-          } : undefined);
+          return renderCostGraph(records, live, width);
         },
         invalidate: () => {},
       };
@@ -128,14 +121,20 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, _ctx) => {
     if (event.message.role !== "assistant") return;
     const msg = event.message as AssistantMessage;
-    currentRequestCost      += msg.usage?.cost?.total ?? 0;
-    // Input/cacheHit/cacheWrite are overwritten: later turns have the full
-    // accumulated context, so the last value is always the largest.
-    currentInputTokens       = msg.usage?.input       ?? 0;
-    currentCacheHitTokens    = msg.usage?.cacheRead   ?? 0;
-    currentCacheWriteTokens  = msg.usage?.cacheWrite  ?? 0;
-    // Output accumulates across turns within one run.
-    currentOutputTokens     += msg.usage?.output      ?? 0;
+    currentRequestCost      += msg.usage?.cost?.total     ?? 0;
+    // Input/cacheHit/cacheWrite tokens are overwritten: later turns have the
+    // full accumulated context, so the last value is always the largest.
+    currentInputTokens       = msg.usage?.input            ?? 0;
+    currentCacheHitTokens    = msg.usage?.cacheRead        ?? 0;
+    currentCacheWriteTokens  = msg.usage?.cacheWrite       ?? 0;
+    // Output tokens accumulate across turns within one run.
+    currentOutputTokens     += msg.usage?.output           ?? 0;
+    // Per-type costs are all accumulated: every turn pays for its own
+    // input/output/cache, so summing gives the true per-category total.
+    currentInputCost        += msg.usage?.cost?.input      ?? 0;
+    currentOutputCost       += msg.usage?.cost?.output     ?? 0;
+    currentCacheReadCost    += msg.usage?.cost?.cacheRead  ?? 0;
+    currentCacheWriteCost   += msg.usage?.cost?.cacheWrite ?? 0;
     // Refresh the graph live so the in-progress bar updates while streaming.
     widgetTui?.requestRender();
   });
@@ -149,6 +148,10 @@ export default function (pi: ExtensionAPI) {
         outputTokens:     currentOutputTokens,
         cacheWriteTokens: currentCacheWriteTokens,
         cacheHitTokens:   currentCacheHitTokens,
+        inputCost:        currentInputCost,
+        outputCost:       currentOutputCost,
+        cacheReadCost:    currentCacheReadCost,
+        cacheWriteCost:   currentCacheWriteCost,
       });
     }
     currentRequestCost      = 0;
@@ -156,24 +159,15 @@ export default function (pi: ExtensionAPI) {
     currentOutputTokens     = 0;
     currentCacheWriteTokens = 0;
     currentCacheHitTokens   = 0;
+    currentInputCost      = 0;
+    currentOutputCost     = 0;
+    currentCacheReadCost  = 0;
+    currentCacheWriteCost = 0;
     updateStatus(ctx);
     widgetTui?.requestRender();
   });
 
   // ── /burn command ──────────────────────────────────────────────────────────
-
-  if (PI_BURN_DEBUG) {
-    pi.registerCommand("burn-debug", {
-      description: "Print current graph render values (requires PI_BURN_DEBUG env var)",
-      handler: async (_args, ctx) => {
-        if (!lastGraphDebug) {
-          ctx.ui.notify("No graph data rendered yet.", "info");
-          return;
-        }
-        ctx.ui.notify(formatGraphDebug(lastGraphDebug), "info");
-      },
-    });
-  }
 
   pi.registerCommand("burn", {
     description: "Show cost burn rate details for this session",
@@ -192,6 +186,10 @@ export default function (pi: ExtensionAPI) {
     let runOutput           = 0;
     let runCacheWrite       = 0;
     let runCacheHit         = 0;
+    let runInputCost        = 0;
+    let runOutputCost       = 0;
+    let runCacheReadCost    = 0;
+    let runCacheWriteCost   = 0;
 
     function flushRun() {
       if (runCost > 0 || runInput > 0) {
@@ -202,10 +200,15 @@ export default function (pi: ExtensionAPI) {
           outputTokens:     runOutput,
           cacheWriteTokens: runCacheWrite,
           cacheHitTokens:   runCacheHit,
+          inputCost:        runInputCost,
+          outputCost:       runOutputCost,
+          cacheReadCost:    runCacheReadCost,
+          cacheWriteCost:   runCacheWriteCost,
         });
       }
       runCost = 0; runEndTime = 0;
       runInput = 0; runOutput = 0; runCacheWrite = 0; runCacheHit = 0;
+      runInputCost = 0; runOutputCost = 0; runCacheReadCost = 0; runCacheWriteCost = 0;
     }
 
     for (const entry of ctx.sessionManager.getBranch()) {
@@ -217,14 +220,18 @@ export default function (pi: ExtensionAPI) {
         flushRun();
       } else if (msg.role === "assistant") {
         const m = msg as AssistantMessage;
-        runCost      += m.usage?.cost?.total ?? 0;
-        runEndTime    = new Date(entry.timestamp as string | number).getTime();
+        runCost          += m.usage?.cost?.total     ?? 0;
+        runEndTime        = new Date(entry.timestamp as string | number).getTime();
         // Overwrite: later turns have the full accumulated context.
-        runInput      = m.usage?.input       ?? 0;
-        runCacheHit   = m.usage?.cacheRead   ?? 0;
-        runCacheWrite = m.usage?.cacheWrite   ?? 0;
-        // Output accumulates.
-        runOutput    += m.usage?.output      ?? 0;
+        runInput          = m.usage?.input            ?? 0;
+        runCacheHit       = m.usage?.cacheRead        ?? 0;
+        runCacheWrite     = m.usage?.cacheWrite       ?? 0;
+        // Output and all per-type costs accumulate across turns.
+        runOutput        += m.usage?.output           ?? 0;
+        runInputCost     += m.usage?.cost?.input      ?? 0;
+        runOutputCost    += m.usage?.cost?.output     ?? 0;
+        runCacheReadCost += m.usage?.cost?.cacheRead  ?? 0;
+        runCacheWriteCost+= m.usage?.cost?.cacheWrite ?? 0;
       }
     }
 
@@ -233,28 +240,6 @@ export default function (pi: ExtensionAPI) {
     flushRun();
 
     return result;
-  }
-
-  function formatGraphDebug(d: GraphDebug): string {
-    const head = [
-      `=== ${d.timestamp} ===`,
-      `maxTotal: ${d.maxTotal}  scale: ${d.scale.toExponential(3)}  bars: ${d.bars.length}`,
-      ` #   total    hit      input    write    output   dots  b  t`,
-    ].join("\n");
-    const rows = d.bars.map((b, i) =>
-      [
-        String(i).padStart(2),
-        String(b.total).padStart(7),
-        String(b.cacheHit).padStart(7),
-        String(b.input).padStart(7),
-        String(b.cacheWrite).padStart(7),
-        String(b.output).padStart(7),
-        String(b.dots).padStart(5),
-        String(b.botDots).padStart(2),
-        String(b.topDots).padStart(2),
-      ].join("  ")
-    ).join("\n");
-    return head + "\n" + rows + "\n\n";
   }
 
   function updateStatus(ctx: ExtensionContext) {
