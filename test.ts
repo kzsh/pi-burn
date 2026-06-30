@@ -202,7 +202,7 @@ check(
   "dim",
 );
 
-// showLegend=false → no legend text, full width used for bars
+// showLegend=false → no legend, bars start at left with no padding
 const noLegendLines = renderCostGraph([fullRecord], null, 20, false);
 const strippedNoLegend = strip(noLegendLines[0] ?? "");
 check(
@@ -210,19 +210,27 @@ check(
   strippedNoLegend.includes("cw") || strippedNoLegend.includes("out") ? "legend" : "no-legend",
   "no-legend",
 );
+// With 1 record and no legend, bars are just 1 braille char wide (no padding)
 check(
-  "showLegend=false → stripped row length = width",
+  "showLegend=false → bars start at left, no padding (1 record = 1 char)",
   String(strippedNoLegend.length),
-  "20",
+  "1",
 );
 
-// Padding: 1 record in a wide graph → legend sits at the right edge
+// Padding: 1 record in a wide graph → bars at left, gap, legend at right edge
 const paddedLines = renderCostGraph([fullRecord], null, 20);
 const strippedPadded = strip(paddedLines[0] ?? "");
 check(
-  "1 record in width=20 → row still fills full width",
+  "1 record in width=20 → total row still fills full width",
   String(strippedPadded.length),
   "20",
+);
+// The single bar char should be first (braille range U+2800–U+28FF), not buried in padding
+const firstCp = strippedPadded.codePointAt(0) ?? 0;
+check(
+  "1 record → bar is at left edge (first char is a braille char)",
+  firstCp >= 0x2800 && firstCp <= 0x28FF ? "bar" : "space",
+  "bar",
 );
 
 

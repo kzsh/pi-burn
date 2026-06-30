@@ -174,8 +174,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("burn", {
     description: "Show cost burn rate details and settings for this session",
-    handler: async (_args, ctx) => {
-      if (ctx.mode !== "tui") {
+    handler: async (args, ctx) => {
+      // /burn report → full detail report
+      if (args?.trim() === "report" || ctx.mode !== "tui") {
         ctx.ui.notify(buildDetailReport(records, sessionStartTime, budget), "info");
         return;
       }
@@ -190,11 +191,9 @@ export default function (pi: ExtensionAPI) {
       ];
 
       await ctx.ui.custom((tui, theme, _kb, done) => {
-        const reportLines = buildDetailReport(records, sessionStartTime, budget).split("\n");
-
         const header = new (class {
           render(_width: number) {
-            return [theme.fg("accent", theme.bold("Burn")), "", ...reportLines, ""];
+            return [theme.fg("accent", theme.bold("Burn")), ""];
           }
           invalidate() {}
         })();

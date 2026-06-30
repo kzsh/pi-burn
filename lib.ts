@@ -166,18 +166,18 @@ export function renderCostGraph(
     bottomLine += isLive ? DIM + botCh + ANSI_RESET : botCh;
   }
 
-  // Left-pad bars so the legend is always flush at the right edge.
+  if (!showLegend) {
+    return [topLine, bottomLine];
+  }
+
+  // Right-align the legend: pad between bars and legend so legend sits at the right edge.
   const charCount = Math.ceil(data.length / 2);
   const pad = " ".repeat(Math.max(0, barWidth - charCount));
-
-  if (!showLegend) {
-    return [pad + topLine, pad + bottomLine];
-  }
 
   const topLegend = `  ${COLOR_CACHE_WRITE}\u25cf${ANSI_RESET}cw ${COLOR_OUTPUT}\u25cf${ANSI_RESET}out`;
   const botLegend = `  ${COLOR_CACHE_READ}\u25cf${ANSI_RESET}cr ${COLOR_INPUT}\u25cf${ANSI_RESET}in `;
 
-  return [pad + topLine + topLegend, pad + bottomLine + botLegend];
+  return [topLine + pad + topLegend, bottomLine + pad + botLegend];
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
