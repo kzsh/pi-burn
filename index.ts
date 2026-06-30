@@ -27,6 +27,7 @@
  *               orange = output     (most expensive per token)
  */
 
+import { appendFileSync } from "fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
@@ -34,9 +35,13 @@ import {
   buildDetailReport,
   buildStatusParts,
   renderBurnGraph,
+  type GraphDebug,
   type RequestRecord,
   type StatusStyle,
 } from "./lib.ts";
+
+const PI_BURN_DEBUG = !!process.env["PI_BURN_DEBUG"];
+const DEBUG_LOG     = "/tmp/pi-burn-graph.log";
 
 // pi's theme color names that correspond to our StatusStyle values.
 const THEME_COLOR: Record<StatusStyle, string> = {
@@ -56,6 +61,7 @@ export default function (pi: ExtensionAPI) {
   let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
+  let lastGraphDebug: GraphDebug | null = null;
 
   pi.registerFlag("burn-budget", {
     description: `Session spend limit in dollars at which the graph turns fully red (default: $${DEFAULT_BUDGET})`,
@@ -102,7 +108,10 @@ export default function (pi: ExtensionAPI) {
                 cacheHitTokens:   currentCacheHitTokens,
               }
             : null;
-          return renderBurnGraph(records, live, width);
+          return renderBurnGraph(records, live, width, PI_BURN_DEBUG ? (d) => {
+            lastGraphDebug = d;
+            appendFileSync(DEBUG_LOG, formatGraphDebug(d));
+          } : undefined);
         },
         invalidate: () => {},
       };
@@ -152,6 +161,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── /burn command ──────────────────────────────────────────────────────────
+
+  if (PI_BURN_DEBUG) {
+    pi.registerCommand("burn-debug", {
+      description: "Print current graph render values (requires PI_BURN_DEBUG env var)",
+      handler: async (_args, ctx) => {
+        if (!lastGraphDebug) {
+          ctx.ui.notify("No graph data rendered yet.", "info");
+          return;
+        }
+        ctx.ui.notify(formatGraphDebug(lastGraphDebug), "info");
+      },
+    });
+  }
 
   pi.registerCommand("burn", {
     description: "Show cost burn rate details for this session",
@@ -206,10 +228,33 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Do not flush the last in-progress run here. It will come in live via
-    // message_end / agent_end events.
+    // Everything in the branch is committed history. Flush the last run so
+    // it appears in the graph on resume.
+    flushRun();
 
     return result;
+  }
+
+  function formatGraphDebug(d: GraphDebug): string {
+    const head = [
+      `=== ${d.timestamp} ===`,
+      `maxTotal: ${d.maxTotal}  scale: ${d.scale.toExponential(3)}  bars: ${d.bars.length}`,
+      ` #   total    hit      input    write    output   dots  b  t`,
+    ].join("\n");
+    const rows = d.bars.map((b, i) =>
+      [
+        String(i).padStart(2),
+        String(b.total).padStart(7),
+        String(b.cacheHit).padStart(7),
+        String(b.input).padStart(7),
+        String(b.cacheWrite).padStart(7),
+        String(b.output).padStart(7),
+        String(b.dots).padStart(5),
+        String(b.botDots).padStart(2),
+        String(b.topDots).padStart(2),
+      ].join("  ")
+    ).join("\n");
+    return head + "\n" + rows + "\n\n";
   }
 
   function updateStatus(ctx: ExtensionContext) {

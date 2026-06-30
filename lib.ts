@@ -6,6 +6,24 @@
 // ($4 on the default $10 budget); at 100% it turns fully red.
 export const DEFAULT_BUDGET = 10;
 
+export type GraphBarDebug = {
+  total:      number;
+  cacheHit:   number;
+  input:      number;
+  cacheWrite: number;
+  output:     number;
+  dots:       number;  // 0–8, scaled bar height
+  botDots:    number;  // 0–4, lower braille row
+  topDots:    number;  // 0–4, upper braille row
+};
+
+export type GraphDebug = {
+  timestamp: string;
+  maxTotal:  number;
+  scale:     number;
+  bars:      GraphBarDebug[];
+};
+
 export type RequestRecord = {
   endTime: number;       // ms epoch
   cost: number;          // USD
@@ -95,6 +113,7 @@ export function renderBurnGraph(
   records: RequestRecord[],
   liveRecord: RequestRecord | null,
   width: number,
+  debugOut?: (d: GraphDebug) => void,
 ): string[] {
   const allData = liveRecord ? [...records, liveRecord] : records;
   if (allData.length === 0) return [];
@@ -105,16 +124,39 @@ export function renderBurnGraph(
   const maxTotal = Math.max(1, ...data.map(tokenTotal));
   const scale    = 8 / maxTotal; // maps token count → 0-8 dot space
 
-  // If the slice has an odd length, start at index -1 so the very first char
-  // uses only its right column, keeping the newest point flush-right.
-  const startIdx = -(data.length % 2);
+  if (debugOut) {
+    debugOut({
+      timestamp: new Date().toISOString(),
+      maxTotal,
+      scale,
+      bars: data.map(r => {
+        const total = tokenTotal(r);
+        const dots  = Math.round(total * scale);
+        return {
+          total,
+          cacheHit:   r.cacheHitTokens,
+          input:      r.inputTokens,
+          cacheWrite: r.cacheWriteTokens,
+          output:     r.outputTokens,
+          dots,
+          botDots: Math.min(4, dots),
+          topDots: Math.max(0, dots - 4),
+        };
+      }),
+    });
+  }
 
+  // Pair bars left-to-right: (0,1)(2,3)…  When the count is odd the newest
+  // bar sits alone in the right column of the last character, with the left
+  // column empty.  This keeps every historical pair stable — adding one new
+  // bar only touches the rightmost character, never shifts the whole graph.
   let topLine    = "";
   let bottomLine = "";
 
-  for (let i = startIdx; i < data.length; i += 2) {
-    const lRec = i >= 0              ? data[i]!     : null;
-    const rRec = i + 1 < data.length ? data[i + 1]! : null;
+  for (let i = 0; i < data.length; i += 2) {
+    const lastAlone = (data.length % 2 === 1) && (i === data.length - 1);
+    const lRec = lastAlone ? null     : data[i]!;
+    const rRec = lastAlone ? data[i]! : (i + 1 < data.length ? data[i + 1]! : null);
 
     const lDots = lRec ? Math.round(tokenTotal(lRec) * scale) : 0;
     const rDots = rRec ? Math.round(tokenTotal(rRec) * scale) : 0;
@@ -229,8 +271,9 @@ export function buildDetailReport(
     lines.push("");
     lines.push("Per-request cost history:");
     records.forEach((r, i) => {
-      const ctx = (r.inputTokens + r.cacheHitTokens) > 0
-        ? `  ${((r.inputTokens + r.cacheHitTokens) / 1000).toFixed(0)}k ctx`
+      const ctxTokens = tokenTotal(r) - r.outputTokens;
+      const ctx = ctxTokens > 0
+        ? `  ${(ctxTokens / 1000).toFixed(0)}k ctx`
         : "";
       lines.push(`  [${String(i + 1).padStart(2)}]  ${formatCost(r.cost)}${ctx}`);
     });
