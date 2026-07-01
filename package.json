@@ -11,6 +11,8 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-tui": "*"
   },
+  "files": ["index.ts", "lib.ts"],
+  "publishConfig": { "access": "public" },
   "pi": {
     "extensions": ["./index.ts"]
   }
