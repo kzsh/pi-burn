@@ -211,19 +211,6 @@ export function buildStatusParts(records: RequestRecord[]): StatusPart[] {
     }
   }
 
-  if (records.length >= 4) {
-    const mid = Math.floor(records.length / 2);
-    const earlyAvg  = records.slice(0, mid).reduce((s, r) => s + r.cost, 0) / mid;
-    const recentAvg = records.slice(mid).reduce((s, r) => s + r.cost, 0) / (records.length - mid);
-    const multiplier = earlyAvg > 0 ? recentAvg / earlyAvg : 1;
-
-    if (multiplier > 1.05) {
-      parts.push({ text: `+${multiplier.toFixed(1)}x`, style: "warning" });
-    } else if (multiplier < 0.95) {
-      parts.push({ text: `${multiplier.toFixed(1)}x`, style: "success" });
-    }
-  }
-
   return parts;
 }
 
