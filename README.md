@@ -1,39 +1,44 @@
 # pi-burn
 
-Tracks cost-per-request acceleration in pi sessions. As your context grows,
-each LLM call gets more expensive. pi-burn makes that visible.
+Tracks cost-per-request acceleration in pi sessions. As context grows, each
+request gets more expensive. pi-burn makes that visible in real time.
 
 ## What it shows
 
-The status bar displays three things:
+The status bar updates after every completed request:
 
 ```
-$0.0420  $0.013/req  +2.1x
+$0.013/req  ●cr:$0.001  ●in:$0.011  ●cw:$0.000  ●out:$0.001
 ```
 
 | Field | Meaning |
 |---|---|
-| `$0.0420` | Total session cost so far |
 | `$0.013/req` | Rolling average cost of the last 3 requests |
-| `+2.1x` | Recent requests cost 2.1x more than early ones (acceleration) |
+| `●cr` / `●in` / `●cw` / `●out` | Per-type cost breakdown (cache read, input, cache write, output) |
 
-The multiplier only appears after 4+ completed requests, since you need
-enough data to split into early vs recent halves meaningfully. Within 5%
-either way it's omitted — that's noise, not signal.
+A two-row braille sparkline above the editor shows per-type cost history
+across all requests in the session.
 
 ## Commands
 
-`/burn` — print a full breakdown: total cost, per-request history,
-session duration, and average burn rate per minute.
+`/burn` — open the burn details panel.
+
+`/burn report` — print a full text breakdown: total cost, per-request
+history, session duration, and average burn rate per minute.
+
+## Flags
+
+`--burn-budget <dollars>` — session spend limit used to scale the graph's
+color from green to red. Defaults to `$10`.
 
 ## Installation
 
 ```bash
-pi install git:github.com/kzsh/pi-burn
+pi install npm:@kzsh/pi-burn
 ```
 
-To test without installing globally:
+To try without installing:
 
 ```bash
-pi -e git:github.com/kzsh/pi-burn
+pi -e npm:@kzsh/pi-burn
 ```
