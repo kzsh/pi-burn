@@ -87,18 +87,10 @@ function costZoneColor(dotMid: number, r: RequestRecord, scale: number): string 
   return COLOR_OUTPUT;
 }
 
-// Legend split across the two braille rows (stacking order, bottom first):
-//   bottom row gets:  ●cr ●in   (the types that occupy the lower height bands)
-//   top row gets:     ●cw ●out  (the types that occupy the upper height bands)
-//
-// Both legends are 10 visible chars: "  \u25cfxx \u25cfyyy" where xxx is padded to match.
-const LEGEND_W = 10; // "  ●xx ●yyy" → 2+1+2+1+1+3 = 10
-
 export function renderCostGraph(
   records: RequestRecord[],
   liveRecord: RequestRecord | null,
   width: number,
-  showLegend = true,
 ): string[] {
   const allData = liveRecord ? [...records, liveRecord] : records;
   if (allData.length === 0) return [];
@@ -110,8 +102,7 @@ export function renderCostGraph(
   if (!hasCosts) return [];
 
   // Each braille char covers 2 data points (left + right column).
-  // Reserve space for the legend only when it is shown.
-  const barWidth = Math.max(1, showLegend ? width - LEGEND_W : width);
+  const barWidth = Math.max(1, width);
   const data = allData.slice(-(barWidth * 2));
 
   const maxCost = Math.max(
@@ -166,23 +157,12 @@ export function renderCostGraph(
     bottomLine += isLive ? DIM + botCh + ANSI_RESET : botCh;
   }
 
-  if (!showLegend) {
-    return [topLine, bottomLine];
-  }
-
-  // Right-align the legend: pad between bars and legend so legend sits at the right edge.
-  const charCount = Math.ceil(data.length / 2);
-  const pad = " ".repeat(Math.max(0, barWidth - charCount));
-
-  const topLegend = `  ${COLOR_CACHE_WRITE}\u25cf${ANSI_RESET}cw ${COLOR_OUTPUT}\u25cf${ANSI_RESET}out`;
-  const botLegend = `  ${COLOR_CACHE_READ}\u25cf${ANSI_RESET}cr ${COLOR_INPUT}\u25cf${ANSI_RESET}in `;
-
-  return [topLine + pad + topLegend, bottomLine + pad + botLegend];
+  return [topLine, bottomLine];
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
 
-export type StatusStyle = "dim" | "muted" | "warning" | "success";
+export type StatusStyle = "dim" | "muted" | "warning" | "success" | "raw";
 
 export type StatusPart = {
   text: string;
@@ -221,16 +201,13 @@ export function buildStatusParts(records: RequestRecord[]): StatusPart[] {
       const avgOutput     = avg(r => r.outputCost);
 
       const fmt = (n: number) => `$${n.toFixed(3)}`;
-      const breakdown = [
-        `cr:${fmt(avgCacheRead)}`,
-        `in:${fmt(avgInput)}`,
-        `cw:${fmt(avgCacheWrite)}`,
-        `out:${fmt(avgOutput)}`,
-      ].join("  ");
+      const breakdown =
+        `${COLOR_CACHE_READ}\u25cfcr${ANSI_RESET}:${fmt(avgCacheRead)}  ` +
+        `${COLOR_INPUT}\u25cfin${ANSI_RESET}:${fmt(avgInput)}  ` +
+        `${COLOR_CACHE_WRITE}\u25cfcw${ANSI_RESET}:${fmt(avgCacheWrite)}  ` +
+        `${COLOR_OUTPUT}\u25cfout${ANSI_RESET}:${fmt(avgOutput)}`;
 
-      if (breakdown) {
-        parts.push({ text: breakdown, style: "dim" });
-      }
+      parts.push({ text: breakdown, style: "raw" });
     }
   }
 

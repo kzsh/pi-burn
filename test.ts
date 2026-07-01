@@ -41,16 +41,22 @@ function withCostSplit(r: Omit<RequestRecord, 'inputCost'|'outputCost'|'cacheRea
 
 const RESET = "\x1b[0m";
 
-const STYLE_ANSI: Record<StatusStyle, string> = {
+const STYLE_ANSI: Record<Exclude<StatusStyle, "raw">, string> = {
   dim:     "\x1b[2m",
   muted:   "\x1b[90m",
   warning: "\x1b[33m",
   success: "\x1b[32m",
 };
 
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[\d;]*m/g, "");
+}
+
 function renderStatus(records: RequestRecord[]): string {
   const parts = buildStatusParts(records);
-  return parts.map(p => STYLE_ANSI[p.style] + p.text + RESET).join("  ");
+  return parts.map(p =>
+    p.style === "raw" ? p.text : STYLE_ANSI[p.style] + p.text + RESET
+  ).join("  ");
 }
 
 // Helper to render the two-row graph as a block for show().
@@ -164,10 +170,6 @@ const fullRecord = withCostSplit({
 const fullLines = renderCostGraph([fullRecord], null, 40);
 const strip = (s: string) => s.replace(/\x1b\[[^m]*m/g, "");
 check("full cost record → 2 rows",          String(fullLines.length), "2");
-check("top row legend contains 'cw'",       strip(fullLines[0] ?? "").includes("cw") ? "yes" : "no", "yes");
-check("top row legend contains 'out'",      strip(fullLines[0] ?? "").includes("out") ? "yes" : "no", "yes");
-check("bottom row legend contains 'cr'",    strip(fullLines[1] ?? "").includes("cr") ? "yes" : "no", "yes");
-check("bottom row legend contains 'in'",    strip(fullLines[1] ?? "").includes("in") ? "yes" : "no", "yes");
 
 // Records without cost fields → no graph
 const noCostRecord: RequestRecord = {
@@ -180,8 +182,7 @@ check(
   "empty",
 );
 
-// Width: barWidth = max(1, width - LEGEND_W(10)); each braille char = 2 records.
-// At width=20: barWidth=10 chars; stripped row = 10 bars + 10 legend = 20.
+// Each braille char covers 2 records; width=20 → up to 20 chars displayed.
 const wideRecords = Array.from({ length: 40 }, (_, i) => withCostSplit({
   endTime: i, cost: 0.005,
   inputTokens: 5_000, outputTokens: 500, cacheWriteTokens: 500, cacheHitTokens: i * 1_000,
@@ -189,7 +190,7 @@ const wideRecords = Array.from({ length: 40 }, (_, i) => withCostSplit({
 const narrowLines = renderCostGraph(wideRecords, null, 20);
 const strippedNarrow = strip(narrowLines[0] ?? "");
 check(
-  "width=20 → stripped row length = 20 (10 braille + 10 legend)",
+  "width=20 → stripped row length = 20",
   String(strippedNarrow.length),
   "20",
 );
@@ -202,31 +203,8 @@ check(
   "dim",
 );
 
-// showLegend=false → no legend, bars start at left with no padding
-const noLegendLines = renderCostGraph([fullRecord], null, 20, false);
-const strippedNoLegend = strip(noLegendLines[0] ?? "");
-check(
-  "showLegend=false → no legend keywords in output",
-  strippedNoLegend.includes("cw") || strippedNoLegend.includes("out") ? "legend" : "no-legend",
-  "no-legend",
-);
-// With 1 record and no legend, bars are just 1 braille char wide (no padding)
-check(
-  "showLegend=false → bars start at left, no padding (1 record = 1 char)",
-  String(strippedNoLegend.length),
-  "1",
-);
-
-// Padding: 1 record in a wide graph → bars at left, gap, legend at right edge
-const paddedLines = renderCostGraph([fullRecord], null, 20);
-const strippedPadded = strip(paddedLines[0] ?? "");
-check(
-  "1 record in width=20 → total row still fills full width",
-  String(strippedPadded.length),
-  "20",
-);
-// The single bar char should be first (braille range U+2800–U+28FF), not buried in padding
-const firstCp = strippedPadded.codePointAt(0) ?? 0;
+// 1 record → single braille char at the left edge
+const firstCp = strip(fullLines[0] ?? "").codePointAt(0) ?? 0;
 check(
   "1 record → bar is at left edge (first char is a braille char)",
   firstCp >= 0x2800 && firstCp <= 0x28FF ? "bar" : "space",
@@ -306,15 +284,16 @@ const breakdownRec: RequestRecord = {
 };
 const breakdownParts = buildStatusParts([breakdownRec]);
 const breakdownText  = breakdownParts[1]?.text ?? "";
-check("breakdown part is dim",          breakdownParts[1]?.style ?? "", "dim");
-check("breakdown contains cr cost",     breakdownText.includes("cr:") ? "yes" : "no", "yes");
-check("breakdown contains in cost",     breakdownText.includes("in:") ? "yes" : "no", "yes");
-check("breakdown contains cw cost",     breakdownText.includes("cw:") ? "yes" : "no", "yes");
-check("breakdown contains out cost",    breakdownText.includes("out:") ? "yes" : "no", "yes");
-check("breakdown cr value",             breakdownText.match(/cr:(\S+)/)?.[1] ?? "", "$0.001");
-check("breakdown in value",             breakdownText.match(/in:(\S+)/)?.[1] ?? "", "$0.003");
-check("breakdown cw value",             breakdownText.match(/cw:(\S+)/)?.[1] ?? "", "$0.001");
-check("breakdown out value",            breakdownText.match(/out:(\S+)/)?.[1] ?? "", "$0.015");
+const plainBreakdown = stripAnsi(breakdownText);
+check("breakdown part is raw",          breakdownParts[1]?.style ?? "", "raw");
+check("breakdown contains cr cost",     plainBreakdown.includes("cr:") ? "yes" : "no", "yes");
+check("breakdown contains in cost",     plainBreakdown.includes("in:") ? "yes" : "no", "yes");
+check("breakdown contains cw cost",     plainBreakdown.includes("cw:") ? "yes" : "no", "yes");
+check("breakdown contains out cost",    plainBreakdown.includes("out:") ? "yes" : "no", "yes");
+check("breakdown cr value",             plainBreakdown.match(/cr:(\S+)/)?.[1] ?? "", "$0.001");
+check("breakdown in value",             plainBreakdown.match(/in:(\S+)/)?.[1] ?? "", "$0.003");
+check("breakdown cw value",             plainBreakdown.match(/cw:(\S+)/)?.[1] ?? "", "$0.001");
+check("breakdown out value",            plainBreakdown.match(/out:(\S+)/)?.[1] ?? "", "$0.015");
 // Records without per-type costs still show no breakdown part
 const noBreakdownRec: RequestRecord = {
   endTime: 1, cost: 0.005,

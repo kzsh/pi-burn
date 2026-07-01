@@ -20,7 +20,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Container, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { Container, SettingsList } from "@earendil-works/pi-tui";
 import {
   DEFAULT_BUDGET,
   buildDetailReport,
@@ -31,7 +31,8 @@ import {
 } from "./lib.ts";
 
 // pi's theme color names that correspond to our StatusStyle values.
-const THEME_COLOR: Record<StatusStyle, string> = {
+// "raw" parts carry their own ANSI codes and bypass theme wrapping.
+const THEME_COLOR: Record<Exclude<StatusStyle, "raw">, string> = {
   dim:     "dim",
   muted:   "muted",
   warning: "warning",
@@ -52,7 +53,6 @@ export default function (pi: ExtensionAPI) {
   let budget = DEFAULT_BUDGET;
   let sessionStartTime = 0;
   let widgetTui: { requestRender(): void } | null = null;
-  let showLegend = true;
 
   pi.registerFlag("burn-budget", {
     description: `Session spend limit in dollars at which the graph turns fully red (default: $${DEFAULT_BUDGET})`,
@@ -107,7 +107,7 @@ export default function (pi: ExtensionAPI) {
                 cacheWriteCost:   currentCacheWriteCost,
               }
             : null;
-          return renderCostGraph(records, live, width, showLegend);
+          return renderCostGraph(records, live, width);
         },
         invalidate: () => {},
       };
@@ -181,14 +181,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const items: SettingItem[] = [
-        {
-          id: "legend",
-          label: "Graph legend",
-          currentValue: showLegend ? "on" : "off",
-          values: ["on", "off"],
-        },
-      ];
+      const items = [];
 
       await ctx.ui.custom((tui, theme, _kb, done) => {
         const header = new (class {
@@ -202,12 +195,7 @@ export default function (pi: ExtensionAPI) {
           items,
           items.length + 2,
           getSettingsListTheme(),
-          (id, newValue) => {
-            if (id === "legend") {
-              showLegend = newValue === "on";
-              widgetTui?.requestRender();
-            }
-          },
+          (_id, _newValue) => {},
           () => done(undefined),
         );
 
@@ -298,7 +286,9 @@ export default function (pi: ExtensionAPI) {
     const parts = buildStatusParts(records);
     ctx.ui.setStatus(
       "burn",
-      parts.map(p => theme.fg(THEME_COLOR[p.style], p.text)).join("  "),
+      parts.map(p =>
+        p.style === "raw" ? p.text : theme.fg(THEME_COLOR[p.style], p.text)
+      ).join("  "),
     );
   }
 
