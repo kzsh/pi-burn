@@ -1,7 +1,7 @@
 {
   "name": "@kzsh/pi-burn",
   "version": "0.0.1",
-  "description": "Track cost-per-request acceleration in pi sessions",
+  "description": "Track cost-per-request in pi sessions",
   "keywords": ["pi-package"],
   "scripts": {
     "test": "bun test.ts"
